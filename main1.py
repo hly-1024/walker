@@ -39,11 +39,17 @@ TASK_REGIONS = (
 )
 
 SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 1000)))
+SCALE_TOPK_FULL_PAIRINGS = (("M1", "M2"), ("M3", "M4"), ("M5", "M6"), ("M7", "M8"))
 TOPK_SENSITIVITY_VALUES = (1, 2, 3, 4, 6, 8, 10, 12)
 SPARSE_ACTIVATION_RATIOS = (
-    0.05,
+    0.02,
+    0.04,
+    0.06,
+    0.08,
     0.10,
+    0.12,
     0.15,
+    0.18,
     0.20,
     0.25,
     0.30,
@@ -53,7 +59,8 @@ SPARSE_ACTIVATION_RATIOS = (
     0.50,
     0.60,
     0.70,
-    0.85,
+    0.80,
+    0.90,
     1.00,
 )
 SPARSE_RANDOM_REPEATS = 5
@@ -61,7 +68,7 @@ STRESS_TASK_DATA_FACTOR = 1.8
 STRESS_TASK_GEN_FACTOR = 1.4
 STRESS_TX_RATE_FACTOR = 0.55
 STRESS_QUEUE_FACTOR = 0.65
-ABLATION_TASK_REGION_WEIGHTS = np.asarray((0.70, 0.10, 0.10, 0.10), dtype=np.float64)
+ABLATION_TASK_REGION_WEIGHTS = np.asarray((0.85, 0.05, 0.05, 0.05), dtype=np.float64)
 ABLATION_CONFIGS = (
     ("Proposed", {"future_gs": True, "energy": True, "task_priority": True, "buffer_pressure": True}),
     ("No Future GS", {"future_gs": False, "energy": True, "task_priority": True, "buffer_pressure": True}),
@@ -117,6 +124,35 @@ def scale_node_targets(n_total: int) -> np.ndarray:
     if n_total > 0 and n_total not in targets:
         targets.append(int(n_total))
     return np.asarray(sorted(set(targets)), dtype=int)
+
+
+def _annotate_scale_pair_metrics(rows: List[Dict]) -> None:
+    for row in rows:
+        row.setdefault("paired_full_method_id", "")
+        row.setdefault("online_speedup_vs_full", np.nan)
+        row.setdefault("delivery_loss_pp_vs_full", np.nan)
+
+    index = {
+        (int(row.get("satellite_count", 0)), int(row.get("repeat", 0)), str(row.get("method_id", ""))): row
+        for row in rows
+    }
+    for full_id, topk_id in SCALE_TOPK_FULL_PAIRINGS:
+        for key, topk_row in list(index.items()):
+            sat_count, repeat_i, method_id = key
+            if method_id != topk_id:
+                continue
+            full_row = index.get((sat_count, repeat_i, full_id))
+            if full_row is None:
+                continue
+            full_online = float(full_row.get("online_scheduling_time_s", np.nan))
+            topk_online = float(topk_row.get("online_scheduling_time_s", np.nan))
+            full_delivery = float(full_row.get("delivery_ratio", np.nan))
+            topk_delivery = float(topk_row.get("delivery_ratio", np.nan))
+            topk_row["paired_full_method_id"] = full_id
+            if np.isfinite(full_online) and np.isfinite(topk_online) and topk_online > 1e-9:
+                topk_row["online_speedup_vs_full"] = full_online / topk_online
+            if np.isfinite(full_delivery) and np.isfinite(topk_delivery):
+                topk_row["delivery_loss_pp_vs_full"] = (full_delivery - topk_delivery) * 100.0
 
 
 def _compute_isl_topk(pos_icrf: np.ndarray, k_neighbors: int, max_dist: float, verbose: bool = False) -> Tuple[np.ndarray, np.ndarray]:
@@ -263,13 +299,23 @@ def make_stress_config(cfg: Config) -> Config:
 def make_ablation_stress_config(cfg: Config) -> Config:
     """Create a stronger stress scenario used only by the cross-layer ablation."""
     ablation = make_stress_config(cfg)
-    ablation.TASK_DATA_MB = float(cfg.TASK_DATA_MB) * 2.2
-    ablation.TASK_GEN_RATE = float(cfg.TASK_GEN_RATE) * 1.8
-    ablation.TX_RATE_ISL = float(cfg.TX_RATE_ISL) * 0.45
-    ablation.TX_RATE_SGL = float(cfg.TX_RATE_SGL) * 0.45
-    ablation.Q_MAX_COMM = float(cfg.Q_MAX_COMM) * 0.40
-    ablation.CACHE_TTL_S = float(cfg.CACHE_TTL_S) * 0.50
+    ablation.TASK_DATA_MB = float(cfg.TASK_DATA_MB) * 3.0
+    ablation.TASK_GEN_RATE = float(cfg.TASK_GEN_RATE) * 2.2
+    ablation.TX_RATE_ISL = float(cfg.TX_RATE_ISL) * 0.35
+    ablation.TX_RATE_SGL = float(cfg.TX_RATE_SGL) * 0.35
+    ablation.Q_MAX_COMM = float(cfg.Q_MAX_COMM) * 0.20
+    ablation.CACHE_TTL_S = float(cfg.CACHE_TTL_S) * 0.30
     ablation.GS_ANTENNAS = 1
+    ablation.E_SOLAR_CHG = float(cfg.E_SOLAR_CHG) * 0.45
+    ablation.E_BASE_DRAIN = float(cfg.E_BASE_DRAIN) * 1.35
+    ablation.E_TX_DRAIN = float(cfg.E_TX_DRAIN) * 2.50
+    ablation.E_SENSE_DRAIN = float(cfg.E_SENSE_DRAIN) * 2.00
+    ablation.ADAPTIVE_K_BASE = 4
+    ablation.ADAPTIVE_K_MIN = 2
+    ablation.ADAPTIVE_K_MAX = int(cfg.ADAPTIVE_K_MAX)
+    ablation.ADAPTIVE_K_ALPHA = 10.0
+    ablation.ADAPTIVE_K_BETA = 3.0
+    ablation.ADAPTIVE_K_GAMMA = 3.0
     return ablation
 
 
@@ -884,6 +930,7 @@ class SimulationEngine:
         sat: int,
         amount: float,
         forward: bool,
+        prioritize_task: bool = True,
     ) -> Tuple[float, np.ndarray, Dict[int, List[Dict]], float, int]:
         remaining = max(float(amount), 0.0)
         moved_by_region = np.zeros(q_region.shape[0], dtype=np.float64)
@@ -892,7 +939,11 @@ class SimulationEngine:
         max_hop = 0
         max_hops = int(self.cfg.MAX_RELAY_HOPS)
 
-        for region_i in np.argsort(-self.dl.task_region_weights):
+        if prioritize_task:
+            region_order = np.argsort(-self.dl.task_region_weights)
+        else:
+            region_order = np.roll(np.arange(q_region.shape[0]), int(sat) % max(q_region.shape[0], 1))
+        for region_i in region_order:
             if remaining <= 1e-9:
                 break
             key = (int(region_i), int(sat))
@@ -952,9 +1003,10 @@ class SimulationEngine:
         sender: int,
         receiver: int,
         amount: float,
+        prioritize_task: bool = True,
     ) -> Tuple[float, int]:
         moved_total, moved_by_region, moved_batches, _hop_sum, max_hop = self._deplete_batch_queue(
-            batch_queues, q_region, sender, amount, forward=True
+            batch_queues, q_region, sender, amount, forward=True, prioritize_task=prioritize_task
         )
         if moved_total > 0.0:
             q_region[:, int(receiver)] += moved_by_region
@@ -976,9 +1028,10 @@ class SimulationEngine:
         batch_queues: Dict[Tuple[int, int], deque],
         sat: int,
         amount: float,
+        prioritize_task: bool = True,
     ) -> Tuple[float, np.ndarray, float, int]:
         moved_total, moved_by_region, _moved_batches, hop_sum, max_hop = self._deplete_batch_queue(
-            batch_queues, q_region, sat, amount, forward=False
+            batch_queues, q_region, sat, amount, forward=False, prioritize_task=prioritize_task
         )
         return moved_total, moved_by_region, float(hop_sum), int(max_hop)
 
@@ -1009,7 +1062,7 @@ class SimulationEngine:
             [
                 (True, 0.15, distance_score),
                 (self._score_flag(score_flags, "buffer_pressure"), 0.20, source_buffer_pressure),
-                (True, 0.15, receiver_free_capacity),
+                (self._score_flag(score_flags, "buffer_pressure"), 0.15, receiver_free_capacity),
                 (self._score_flag(score_flags, "future_gs"), 0.20, gs_direction_score),
                 (self._score_flag(score_flags, "energy"), 0.15, energy_score),
                 (self._score_flag(score_flags, "task_priority"), 0.15, task_priority),
@@ -1119,6 +1172,8 @@ class SimulationEngine:
             if use_topk:
                 if fixed_topk_k is None:
                     sender_pressure = q_total[s] / max(cfg.Q_MAX_COMM, 1e-9)
+                    if not self._score_flag(score_flags, "buffer_pressure"):
+                        sender_pressure = 0.0
                     sender_gs = float(self._future_gs_score(t, np.asarray([s]))[0]) if use_window_urgency else float(dl.vis_gs[t, s])
                     sender_priority = float(self._task_priority(q_region, np.asarray([s]), dl.task_region_weights)[0])
                     k_s = self._adaptive_k_value(sender_pressure, sender_gs, sender_priority)
@@ -1184,7 +1239,14 @@ class SimulationEngine:
             tx = min(movable_total[s], tx_cap, cfg.Q_MAX_COMM - q_total[r])
             if tx <= 0.0:
                 continue
-            moved, max_hop = self._move_region_queue(q_region, batch_queues, s, r, tx)
+            moved, max_hop = self._move_region_queue(
+                q_region,
+                batch_queues,
+                s,
+                r,
+                tx,
+                prioritize_task=self._score_flag(score_flags, "task_priority"),
+            )
             if moved <= 0.0:
                 continue
             q_total[s] -= moved
@@ -1445,7 +1507,11 @@ class SimulationEngine:
                     if tx <= 0.0:
                         continue
                     actual_tx, delivered_regions, hop_sum, max_hop = self._deplete_downlink_queue(
-                        q_region, batch_queues, int(sat), tx
+                        q_region,
+                        batch_queues,
+                        int(sat),
+                        tx,
+                        prioritize_task=self._score_flag(score_flags, "task_priority"),
                     )
                     if actual_tx <= 0.0:
                         continue
@@ -2440,6 +2506,8 @@ def run_scalability_experiment(
         "delivery_ratio",
         "packet_loss_rate",
         "utility",
+        "online_speedup_vs_full",
+        "delivery_loss_pp_vs_full",
     ]
 
     def median_summary(summaries: List[Dict]) -> Dict:
@@ -2531,11 +2599,14 @@ def run_scalability_experiment(
                     "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
                     "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
                     "utility": float(summary.get("utility", 0.0)),
+                    "online_speedup_vs_full": np.nan,
+                    "delivery_loss_pp_vs_full": np.nan,
                 }
                 series[item["method_id"]]["raw"].append(raw_record)
                 raw_rows.append(raw_record)
             print(f"  scale point nodes={sub_dl.N} repeat {rep + 1}/{repeat_count} completed")
 
+    _annotate_scale_pair_metrics(raw_rows)
     for method in series.values():
         records = list(method.pop("raw", []))
         for key in metric_keys:
@@ -2547,11 +2618,15 @@ def run_scalability_experiment(
                     [float(row[key]) for row in records if int(row["satellite_count"]) == int(n)],
                     dtype=np.float64,
                 )
-                if vals.size == 0:
-                    vals = np.asarray([0.0], dtype=np.float64)
-                vals_median.append(float(np.median(vals)))
-                vals_q25.append(float(np.quantile(vals, 0.25)))
-                vals_q75.append(float(np.quantile(vals, 0.75)))
+                finite_vals = vals[np.isfinite(vals)]
+                if finite_vals.size == 0:
+                    vals_median.append(np.nan)
+                    vals_q25.append(np.nan)
+                    vals_q75.append(np.nan)
+                    continue
+                vals_median.append(float(np.median(finite_vals)))
+                vals_q25.append(float(np.quantile(finite_vals, 0.25)))
+                vals_q75.append(float(np.quantile(finite_vals, 0.75)))
             method[key] = vals_median
             method[f"{key}_q25"] = vals_q25
             method[f"{key}_q75"] = vals_q75
@@ -2597,6 +2672,8 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
         "delivery_ratio",
         "packet_loss_rate",
         "utility",
+        "online_speedup_vs_full",
+        "delivery_loss_pp_vs_full",
     ]
     rows: List[Dict] = []
     repeat_count = int(scale.get("repeat_count", 1)) if scale else 1
@@ -2617,6 +2694,7 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
             "activation": raw.get("activation", ""),
             "candidate_graph": raw.get("candidate_graph", ""),
             "matcher": raw.get("matcher", ""),
+            "paired_full_method_id": raw.get("paired_full_method_id", ""),
         }
         for key in metric_keys:
             row[key] = raw.get(key, None)
@@ -2637,6 +2715,9 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
                 "activation": method.get("activation", ""),
                 "candidate_graph": method.get("candidate_graph", ""),
                 "matcher": method.get("matcher", ""),
+                "paired_full_method_id": {
+                    topk_id: full_id for full_id, topk_id in SCALE_TOPK_FULL_PAIRINGS
+                }.get(str(method.get("method_id", "")), ""),
             }
             for key in metric_keys:
                 vals = method.get(key, [None] * len(nodes))
@@ -2689,6 +2770,7 @@ def _summary_for_experiment(method: str, ratio: Optional[float], summary: Dict, 
         "sense_active_count": int(counts[0]),
         "comm_active_count": int(counts[1]),
         "utility": float(summary.get("utility", 0.0)),
+        "delivery_utility": float(summary.get("delivery_utility", 0.0)),
         "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
         "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
         "online_scheduling_time_s": float(summary.get("online_scheduling_time_s", 0.0)),
@@ -2996,6 +3078,7 @@ def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) 
     )
     prop = rows[0]
     prop_u = max(abs(float(prop.get("utility", 0.0))), 1e-9)
+    prop_delivery_u = max(abs(float(prop.get("delivery_utility", 0.0))), 1e-9)
     prop_d = float(prop.get("delivery_ratio", 0.0))
     prop_loss = float(prop.get("packet_loss_rate", 0.0))
     prop_energy_raw = prop.get("unit_delivered_energy")
@@ -3003,6 +3086,9 @@ def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) 
     prop_online = float(prop.get("online_scheduling_time_s", 0.0))
     for row in rows:
         row["utility_change_pct_vs_proposed"] = (float(row.get("utility", 0.0)) - float(prop.get("utility", 0.0))) / prop_u * 100.0
+        row["delivery_utility_change_pct_vs_proposed"] = (
+            (float(row.get("delivery_utility", 0.0)) - float(prop.get("delivery_utility", 0.0))) / prop_delivery_u * 100.0
+        )
         row["delivery_ratio_change_vs_proposed"] = float(row.get("delivery_ratio", 0.0)) - prop_d
         row["packet_loss_increase_vs_proposed"] = float(row.get("packet_loss_rate", 0.0)) - prop_loss
         row_energy_raw = row.get("unit_delivered_energy")
@@ -3635,7 +3721,99 @@ class Visualizer:
             )
         self._save(filename)
 
-    def fig1_scale_online_time(self, scale: Dict) -> None:
+    def _plot_scale_curves_on_axis(
+        self,
+        ax,
+        nodes: np.ndarray,
+        methods: List[Dict],
+        metric_key: str,
+        ylabel: str,
+        log_y: bool = False,
+        show_iqr: bool = False,
+        ylim: Optional[Tuple[float, float]] = None,
+    ) -> None:
+        markers = ["o", "s", "D", "^", "v", "P", "X", "*"]
+        for i, method in enumerate(methods):
+            vals = np.asarray(method.get(metric_key, []), dtype=float)
+            if len(vals) != len(nodes):
+                continue
+            linestyle = "-" if method.get("candidate_graph") == "Top-K Graph" else (0, (4, 2))
+            plot_vals = np.maximum(vals, 1e-9) if log_y else vals
+            q25 = np.asarray(method.get(f"{metric_key}_q25", []), dtype=float)
+            q75 = np.asarray(method.get(f"{metric_key}_q75", []), dtype=float)
+            if show_iqr and len(q25) == len(nodes) and len(q75) == len(nodes):
+                q25_plot = np.maximum(q25, 1e-9) if log_y else q25
+                q75_plot = np.maximum(q75, 1e-9) if log_y else q75
+                yerr = np.vstack([np.maximum(plot_vals - q25_plot, 0.0), np.maximum(q75_plot - plot_vals, 0.0)])
+                ax.errorbar(
+                    nodes,
+                    plot_vals,
+                    yerr=yerr,
+                    marker=markers[i % len(markers)],
+                    linestyle=linestyle,
+                    lw=1.65,
+                    ms=5.8,
+                    capsize=2.0,
+                    elinewidth=0.75,
+                    color=method.get("color", "#777777"),
+                    label=self._zh_label(method.get("label", f"M{i + 1}")),
+                    alpha=0.95,
+                )
+            else:
+                ax.plot(
+                    nodes,
+                    plot_vals,
+                    marker=markers[i % len(markers)],
+                    linestyle=linestyle,
+                    lw=1.7,
+                    ms=5.9,
+                    color=method.get("color", "#777777"),
+                    label=self._zh_label(method.get("label", f"M{i + 1}")),
+                    alpha=0.95,
+                )
+        if log_y:
+            ax.set_yscale("log")
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.set_ylabel(ylabel, fontsize=10.8)
+        ax.grid(True, which="major", ls="--", alpha=0.24)
+        ax.grid(True, which="minor", ls=":", alpha=0.12)
+        ax.legend(ncol=2, fontsize=7.8, framealpha=0.96, facecolor="white", edgecolor="#BDBDBD")
+
+    def _plot_scale_pair_axis(
+        self,
+        ax,
+        nodes: np.ndarray,
+        methods: List[Dict],
+        metric_key: str,
+        ylabel: str,
+        baseline: float,
+    ) -> None:
+        method_by_id = {str(method.get("method_id", "")): method for method in methods}
+        markers = ["o", "s", "D", "^"]
+        for i, (full_id, topk_id) in enumerate(SCALE_TOPK_FULL_PAIRINGS):
+            method = method_by_id.get(topk_id)
+            if method is None:
+                continue
+            vals = np.asarray(method.get(metric_key, []), dtype=float)
+            if len(vals) != len(nodes) or not np.any(np.isfinite(vals)):
+                continue
+            ax.plot(
+                nodes,
+                vals,
+                marker=markers[i % len(markers)],
+                lw=1.9,
+                ms=6.0,
+                color=method.get("color", "#777777"),
+                label=f"{topk_id} vs {full_id}",
+                alpha=0.95,
+            )
+        ax.axhline(float(baseline), color="#555555", lw=0.85, ls="--")
+        ax.set_ylabel(ylabel, fontsize=10.8)
+        ax.grid(True, ls="--", alpha=0.24)
+        ax.legend(ncol=2, fontsize=8.2, framealpha=0.96, facecolor="white", edgecolor="#BDBDBD")
+
+    def _fig1_scale_online_time_legacy(self, scale: Dict) -> None:
         self._plot_scale_metric(
             scale,
             "online_scheduling_time_s",
@@ -3645,6 +3823,35 @@ class Visualizer:
             log_y=True,
             show_iqr=True,
         )
+
+    def fig1_scale_online_time(self, scale: Dict) -> None:
+        nodes = np.asarray(scale.get("nodes", []), dtype=float)
+        methods = scale.get("methods", []) if scale else []
+        if len(nodes) == 0 or not methods:
+            self._empty_figure("Fig1_Scale_Online_Scheduling_Time.png", "图1  卫星数量与在线调度时间", "没有规模实验数据。")
+            return
+        fig, axes = self.plt.subplots(2, 1, figsize=(11.0, 8.0), sharex=True)
+        self._plot_scale_curves_on_axis(
+            axes[0],
+            nodes,
+            methods,
+            "online_scheduling_time_s",
+            "在线调度时间(s)",
+            log_y=True,
+            show_iqr=True,
+        )
+        axes[0].set_title("在线调度时间中位数", fontsize=11.4, fontweight="bold")
+        self._plot_scale_pair_axis(
+            axes[1],
+            nodes,
+            methods,
+            "online_speedup_vs_full",
+            "Top-K相对全图加速比",
+            baseline=1.0,
+        )
+        axes[1].set_xlabel("卫星数量", fontsize=11)
+        fig.suptitle("图1  卫星数量与在线调度时间", fontsize=13, fontweight="bold")
+        self._save("Fig1_Scale_Online_Scheduling_Time.png")
 
     def fig2_scale_total_runtime(self, scale: Dict) -> None:
         self._plot_scale_metric(
@@ -3695,7 +3902,7 @@ class Visualizer:
         )
         self._save("Fig3_Scale_Activation_Ratio.png")
 
-    def fig4_scale_delivery_ratio(self, scale: Dict) -> None:
+    def _fig4_scale_delivery_ratio_legacy(self, scale: Dict) -> None:
         methods = scale.get("methods", []) if scale else []
         delivery_values: List[float] = []
         for method in methods:
@@ -3720,6 +3927,48 @@ class Visualizer:
             show_iqr=True,
             ylim=ylim,
         )
+
+    def fig4_scale_delivery_ratio(self, scale: Dict) -> None:
+        nodes = np.asarray(scale.get("nodes", []), dtype=float)
+        methods = scale.get("methods", []) if scale else []
+        if len(nodes) == 0 or not methods:
+            self._empty_figure("Fig4_Scale_Delivery_Ratio.png", "图4  Top-K稀疏候选图的交付性能权衡", "没有规模实验数据。")
+            return
+        delivery_values: List[float] = []
+        for method in methods:
+            for key in ("delivery_ratio_q25", "delivery_ratio", "delivery_ratio_q75"):
+                delivery_values.extend(float(v) for v in method.get(key, []) if v is not None and np.isfinite(float(v)))
+        ylim = None
+        if delivery_values:
+            lo = max(0.0, float(np.min(delivery_values)) - 0.03)
+            hi = min(1.02, float(np.max(delivery_values)) + 0.03)
+            if hi - lo < 0.10:
+                mid = 0.5 * (lo + hi)
+                lo = max(0.0, mid - 0.05)
+                hi = min(1.02, mid + 0.05)
+            ylim = (lo, hi)
+        fig, axes = self.plt.subplots(2, 1, figsize=(11.0, 8.0), sharex=True)
+        self._plot_scale_curves_on_axis(
+            axes[0],
+            nodes,
+            methods,
+            "delivery_ratio",
+            "交付率",
+            show_iqr=True,
+            ylim=ylim,
+        )
+        axes[0].set_title("交付率中位数", fontsize=11.4, fontweight="bold")
+        self._plot_scale_pair_axis(
+            axes[1],
+            nodes,
+            methods,
+            "delivery_loss_pp_vs_full",
+            "Top-K相对全图交付率损失(pp)",
+            baseline=0.0,
+        )
+        axes[1].set_xlabel("卫星数量", fontsize=11)
+        fig.suptitle("图4  Top-K稀疏候选图的交付性能权衡", fontsize=13, fontweight="bold")
+        self._save("Fig4_Scale_Delivery_Ratio.png")
 
     def fig5_nsga_pareto_front(self, X: np.ndarray, F: np.ndarray, dl: DataLoader) -> None:
         if X.size == 0 or F.size == 0:
@@ -3835,7 +4084,7 @@ class Visualizer:
         ax1.legend([line1, line3, line2], [line1.get_label(), line3.get_label(), line2.get_label()], loc="best", fontsize=9.0)
         self._save("Fig8_TopK_Efficiency_Performance.png")
 
-    def fig9_sparse_activation_utility_curve(self, sparse: Dict) -> None:
+    def _fig9_sparse_activation_utility_curve_legacy(self, sparse: Dict) -> None:
         rows = sparse.get("rows", []) if sparse else []
         if not rows:
             self._empty_figure("Fig9_Sparse_Activation_Utility_Curve.png", "图9  稀疏激活率与任务效用", "没有稀疏激活数据。")
@@ -3887,17 +4136,71 @@ class Visualizer:
             ax.legend(loc="best", fontsize=8.8, framealpha=0.96)
         self._save("Fig9_Sparse_Activation_Utility_Curve.png")
 
+    def fig9_sparse_activation_utility_curve(self, sparse: Dict) -> None:
+        rows = sparse.get("rows", []) if sparse else []
+        if not rows:
+            self._empty_figure("Fig9_Sparse_Activation_Utility_Curve.png", "图9  稀疏激活率与交付率", "没有稀疏激活数据。")
+            return
+        df = pd.DataFrame(rows)
+        methods = list(df["method"].drop_duplicates())
+        colors = {
+            "Random Sparse": "#7A7A7A",
+            "Coverage Heuristic": "#1B9E77",
+            "Budget-constrained NSGA-III": "#1F78B4",
+            "Full Activation Reference": "#D95F02",
+        }
+        fig, ax = self.plt.subplots(figsize=(10.5, 5.8))
+        for method in methods:
+            sub = df[df["method"] == method].sort_values("activation_ratio")
+            color = colors.get(method, None)
+            zh_method = self._zh_label(method)
+            if method == "Full Activation Reference":
+                ax.axhline(float(sub["delivery_ratio"].iloc[0]), color=color, lw=2.0, ls="--", label=zh_method)
+                continue
+            if method == "Random Sparse" and {"delivery_ratio_q25", "delivery_ratio_q75"}.issubset(set(sub.columns)):
+                x_vals = sub["activation_ratio"].to_numpy(dtype=float)
+                delivery_vals = sub["delivery_ratio"].to_numpy(dtype=float)
+                delivery_yerr = np.vstack(
+                    [
+                        np.maximum(delivery_vals - sub["delivery_ratio_q25"].to_numpy(dtype=float), 0.0),
+                        np.maximum(sub["delivery_ratio_q75"].to_numpy(dtype=float) - delivery_vals, 0.0),
+                    ]
+                )
+                ax.errorbar(
+                    x_vals,
+                    delivery_vals,
+                    yerr=delivery_yerr,
+                    marker="s",
+                    lw=1.9,
+                    ms=5.2,
+                    capsize=2.0,
+                    elinewidth=0.75,
+                    color=color,
+                    label=zh_method,
+                )
+                continue
+            ax.plot(sub["activation_ratio"], sub["delivery_ratio"], marker="s", lw=1.9, color=color, label=zh_method)
+        ax.set_ylabel("交付率")
+        ax.set_xlabel("通信角色激活比例")
+        ax.set_title("图9  压力场景下稀疏激活率与交付率", fontsize=13, fontweight="bold")
+        ax.grid(True, ls="--", alpha=0.25)
+        ax.legend(loc="best", fontsize=8.8, framealpha=0.96)
+        self._save("Fig9_Sparse_Activation_Utility_Curve.png")
+
     def fig10_cross_layer_ablation(self, ablation: Dict) -> None:
         rows = ablation.get("rows", []) if ablation else []
         if not rows:
             self._empty_figure("Fig10_Cross_Layer_Ablation.png", "图10  跨层评分消融实验", "没有消融实验数据。")
             return
         df = pd.DataFrame(rows)
+        utility_change_key = "delivery_utility_change_pct_vs_proposed"
+        if utility_change_key not in df.columns:
+            utility_change_key = "utility_change_pct_vs_proposed"
         plot_specs = [
             (
-                "utility_drop_pct",
-                "效用下降(%)",
-                -pd.to_numeric(df["utility_change_pct_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                "weighted_utility_drop_pct",
+                "加权效用下降(%)",
+                -pd.to_numeric(df[utility_change_key], errors="coerce").fillna(0.0).to_numpy(dtype=float),
                 lambda v: f"{v:+.1f}%",
             ),
             (
@@ -3913,9 +4216,9 @@ class Visualizer:
                 lambda v: f"{v:+.2f}",
             ),
             (
-                "energy_change_pct",
-                "单位交付能耗变化(%)",
-                pd.to_numeric(df["unit_energy_change_pct_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                "online_time_change_pct",
+                "在线调度时间变化(%)",
+                pd.to_numeric(df["online_time_change_pct_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
                 lambda v: f"{v:+.1f}%",
             ),
         ]
@@ -4131,6 +4434,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--arrival", choices=["fixed", "poisson"], default=None)
     parser.add_argument("--task-packet-mb", type=float, default=None)
+    parser.add_argument("--scale-repeats", type=int, default=None)
+    parser.add_argument("--scale-eval-repeats", type=int, default=None)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-cache", action="store_true")
     return parser.parse_args()
@@ -4157,6 +4462,10 @@ def main() -> None:
         cfg.TASK_ARRIVAL_MODE = str(args.arrival)
     if args.task_packet_mb is not None:
         cfg.TASK_PACKET_MB = float(args.task_packet_mb)
+    if args.scale_repeats is not None:
+        cfg.SCALABILITY_REPEATS = int(max(1, args.scale_repeats))
+    if args.scale_eval_repeats is not None:
+        cfg.SCALABILITY_EVAL_REPEATS = int(max(1, args.scale_eval_repeats))
     if args.no_plots:
         cfg.PLOT = False
     if args.no_cache:
