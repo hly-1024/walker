@@ -1,1 +1,3 @@
 satellite_state_all.csv
+.cache_experiment/
+__pycache__/

@@ -40,12 +40,28 @@ TASK_REGIONS = (
 
 SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 1000)))
 TOPK_SENSITIVITY_VALUES = (1, 2, 3, 4, 6, 8, 10, 12)
-SPARSE_ACTIVATION_RATIOS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0)
+SPARSE_ACTIVATION_RATIOS = (
+    0.05,
+    0.10,
+    0.15,
+    0.20,
+    0.25,
+    0.30,
+    0.35,
+    0.40,
+    0.45,
+    0.50,
+    0.60,
+    0.70,
+    0.85,
+    1.00,
+)
 SPARSE_RANDOM_REPEATS = 5
 STRESS_TASK_DATA_FACTOR = 1.8
 STRESS_TASK_GEN_FACTOR = 1.4
 STRESS_TX_RATE_FACTOR = 0.55
 STRESS_QUEUE_FACTOR = 0.65
+ABLATION_TASK_REGION_WEIGHTS = np.asarray((0.70, 0.10, 0.10, 0.10), dtype=np.float64)
 ABLATION_CONFIGS = (
     ("Proposed", {"future_gs": True, "energy": True, "task_priority": True, "buffer_pressure": True}),
     ("No Future GS", {"future_gs": False, "energy": True, "task_priority": True, "buffer_pressure": True}),
@@ -179,7 +195,7 @@ class Config:
     R_SENSOR: float = 100.0
     TASK_GEN_RATE: float = 100.0
     TASK_ARRIVAL_MODE: str = "poisson"
-    TASK_PACKET_MB: float = 500.0
+    TASK_PACKET_MB: float = 100.0
     TASK_POISSON_SCALE: float = 1.0
     TASK_RADIUS: float = 300.0
     TASK_DATA_MB: float = 20000.0
@@ -200,6 +216,8 @@ class Config:
     COMPLEXITY_REPEATS: int = 3
     COMPLEXITY_MAX_STEPS: int = 96
     BASELINE_REPEATS: int = 1
+    SCALABILITY_REPEATS: int = 3
+    SCALABILITY_EVAL_REPEATS: int = 3
 
     T0_DOY: float = 76.0
     T0_GMST: float = 0.5
@@ -214,11 +232,15 @@ def apply_profile(cfg: Config, profile: str) -> Config:
         cfg.SAT_LIMIT = 120
         cfg.GA_POP = 8
         cfg.GA_GEN = 2
+        cfg.SCALABILITY_REPEATS = 1
+        cfg.SCALABILITY_EVAL_REPEATS = 1
     elif profile == "fast":
         cfg.MAX_STEPS = 240
         cfg.SAT_LIMIT = 400
         cfg.GA_POP = 24
         cfg.GA_GEN = 12
+        cfg.SCALABILITY_REPEATS = 1
+        cfg.SCALABILITY_EVAL_REPEATS = 1
     elif profile != "full":
         raise ValueError(f"unknown profile: {profile}")
     cfg.ISL_NEIGHBOR_K = int(cfg.ADAPTIVE_K_MAX)
@@ -236,6 +258,29 @@ def make_stress_config(cfg: Config) -> Config:
     stress.Q_MAX_COMM = float(cfg.Q_MAX_COMM) * STRESS_QUEUE_FACTOR
     stress.GS_ANTENNAS = max(1, int(cfg.GS_ANTENNAS) // 2)
     return stress
+
+
+def make_ablation_stress_config(cfg: Config) -> Config:
+    """Create a stronger stress scenario used only by the cross-layer ablation."""
+    ablation = make_stress_config(cfg)
+    ablation.TASK_DATA_MB = float(cfg.TASK_DATA_MB) * 2.2
+    ablation.TASK_GEN_RATE = float(cfg.TASK_GEN_RATE) * 1.8
+    ablation.TX_RATE_ISL = float(cfg.TX_RATE_ISL) * 0.45
+    ablation.TX_RATE_SGL = float(cfg.TX_RATE_SGL) * 0.45
+    ablation.Q_MAX_COMM = float(cfg.Q_MAX_COMM) * 0.40
+    ablation.CACHE_TTL_S = float(cfg.CACHE_TTL_S) * 0.50
+    ablation.GS_ANTENNAS = 1
+    return ablation
+
+
+def _with_task_region_weights(dl: "DataLoader", weights: np.ndarray, cfg: Optional[Config] = None) -> "DataLoader":
+    view = DataLoader.__new__(DataLoader)
+    view.__dict__.update(dl.__dict__)
+    w = np.asarray(weights, dtype=np.float64)
+    w = w / max(float(w.sum()), 1e-9)
+    view.cfg = cfg if cfg is not None else dl.cfg
+    view.task_region_weights = w
+    return view
 
 
 class DataLoader:
@@ -2359,104 +2404,171 @@ def run_scalability_experiment(
 ) -> Dict:
     _ = best_gene, nsga_runtime_s
     print("=" * 72)
-    print("S4 Satellite-scale experiment for Fig1-Fig4")
+    print("S4 Satellite-scale experiment for Fig1 and Fig4")
     print("=" * 72)
     n_total = int(dl.N)
     if n_total <= 0:
-        return {"nodes": [], "methods": [], "definitions": {}}
+        return {"nodes": [], "methods": [], "definitions": {}, "raw_rows": []}
 
-    rng = np.random.default_rng(int(cfg.RNG_SEED) + 20260519)
     node_targets = scale_node_targets(n_total)
-    nested_order = rng.permutation(n_total).astype(np.int32)
+    repeat_count = int(max(1, getattr(cfg, "SCALABILITY_REPEATS", 1)))
+    eval_repeats = int(max(1, getattr(cfg, "SCALABILITY_EVAL_REPEATS", 1)))
+    repeat_orders = [
+        np.random.default_rng(int(cfg.RNG_SEED) + 20260519 + 7919 * rep).permutation(n_total).astype(np.int32)
+        for rep in range(repeat_count)
+    ]
     series: Dict[str, Dict] = {}
+    raw_rows: List[Dict] = []
+    metric_keys = [
+        "online_scheduling_time_s",
+        "total_runtime_s",
+        "activation_ratio",
+        "candidate_comm_relay_ratio",
+        "actual_forward_participation_ratio",
+        "actual_forward_unique_satellite_count",
+        "actual_downlink_unique_satellite_count",
+        "avg_actual_isl_send_count",
+        "max_actual_isl_send_count",
+        "avg_actual_isl_receive_count",
+        "max_actual_isl_receive_count",
+        "avg_actual_downlink_count",
+        "max_actual_downlink_count",
+        "avg_delivered_relay_hops",
+        "max_observed_relay_hops",
+        "dropped_ttl_mb",
+        "dropped_melt_mb",
+        "delivery_ratio",
+        "packet_loss_rate",
+        "utility",
+    ]
+
+    def median_summary(summaries: List[Dict]) -> Dict:
+        merged: Dict = {}
+        keys = sorted({key for summary in summaries for key in summary.keys()})
+        for key in keys:
+            vals = []
+            for summary in summaries:
+                val = summary.get(key)
+                if isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(val, bool):
+                    vals.append(float(val))
+            if vals:
+                merged[key] = float(np.median(np.asarray(vals, dtype=np.float64)))
+        return merged
 
     for n in node_targets:
-        if int(n) == n_total:
-            sat_idx = np.arange(n_total, dtype=np.int32)
-        else:
-            sat_idx = np.sort(nested_order[: int(n)].astype(np.int32))
-        sub_dl = _subset_dataloader(dl, cfg, sat_idx)
-        print(f"  scale point nodes={sub_dl.N}: running NSGA-III activation optimization")
-        scale_problem = ConstellationProblem(cfg, sub_dl)
-        scale_solver = NSGA3Solver(cfg)
-        scale_result = scale_solver.optimize(scale_problem.evaluate, sub_dl.N)
-        best_i = select_best_objective_index(scale_result["F"], utility_tol=max(float(cfg.GA_CONV_EPS), 1e-6))
-        scale_best_gene = scale_result["X"][best_i].astype(bool)
-        scale_nsga_runtime = float(scale_result.get("runtime_s", 0.0))
+        for rep, nested_order in enumerate(repeat_orders):
+            if int(n) == n_total:
+                sat_idx = np.arange(n_total, dtype=np.int32)
+            else:
+                sat_idx = np.sort(nested_order[: int(n)].astype(np.int32))
+            sub_dl = _subset_dataloader(dl, cfg, sat_idx)
+            print(
+                f"  scale point nodes={sub_dl.N}: repeat {rep + 1}/{repeat_count} "
+                "running NSGA-III activation optimization"
+            )
+            np.random.seed(int(cfg.RNG_SEED) + 20260519 + 100003 * rep + int(n))
+            scale_problem = ConstellationProblem(cfg, sub_dl)
+            scale_solver = NSGA3Solver(cfg)
+            scale_result = scale_solver.optimize(scale_problem.evaluate, sub_dl.N)
+            best_i = select_best_objective_index(scale_result["F"], utility_tol=max(float(cfg.GA_CONV_EPS), 1e-6))
+            scale_best_gene = scale_result["X"][best_i].astype(bool)
+            scale_nsga_runtime = float(scale_result.get("runtime_s", 0.0))
 
-        engine = SimulationEngine(cfg, sub_dl)
-        for item in build_method_configs(sub_dl, scale_best_gene):
-            if item["method_id"] not in series:
-                series[item["method_id"]] = {
+            engine = SimulationEngine(cfg, sub_dl)
+            for item in build_method_configs(sub_dl, scale_best_gene):
+                if item["method_id"] not in series:
+                    series[item["method_id"]] = {
+                        "method_id": item["method_id"],
+                        "label": item["label"],
+                        "activation": item["activation"],
+                        "candidate_graph": item["candidate_graph"],
+                        "matcher": item["matcher"],
+                        "color": _method_color(item["method_id"]),
+                        "raw": [],
+                    }
+                eval_summaries = []
+                counts = (0, 0)
+                for _eval_rep in range(eval_repeats):
+                    _, counts, hist = engine.evaluate(
+                        item["gene"],
+                        track_history=False,
+                        return_summary=True,
+                        matcher_mode=item["matcher_mode"],
+                        use_topk=item["use_topk"],
+                        use_window_urgency=True,
+                        use_energy_score=True,
+                    )
+                    eval_summaries.append(dict(hist.get("summary", {})) if hist else {})
+                summary = median_summary(eval_summaries)
+                activation_runtime_s = scale_nsga_runtime if item["activation"] == "NSGA-III" else 0.0
+                total_runtime_s = activation_runtime_s + float(summary.get("simulation_runtime_s", 0.0))
+                raw_record = {
+                    "satellite_count": int(sub_dl.N),
+                    "repeat": int(rep + 1),
+                    "eval_repeats": int(eval_repeats),
                     "method_id": item["method_id"],
                     "label": item["label"],
                     "activation": item["activation"],
                     "candidate_graph": item["candidate_graph"],
                     "matcher": item["matcher"],
-                    "color": _method_color(item["method_id"]),
-                    "online_scheduling_time_s": [],
-                    "total_runtime_s": [],
-                    "activation_ratio": [],
-                    "candidate_comm_relay_ratio": [],
-                    "actual_forward_participation_ratio": [],
-                    "actual_forward_unique_satellite_count": [],
-                    "actual_downlink_unique_satellite_count": [],
-                    "avg_actual_isl_send_count": [],
-                    "max_actual_isl_send_count": [],
-                    "avg_actual_isl_receive_count": [],
-                    "max_actual_isl_receive_count": [],
-                    "avg_actual_downlink_count": [],
-                    "max_actual_downlink_count": [],
-                    "avg_delivered_relay_hops": [],
-                    "max_observed_relay_hops": [],
-                    "dropped_ttl_mb": [],
-                    "dropped_melt_mb": [],
-                    "delivery_ratio": [],
-                    "packet_loss_rate": [],
-                    "utility": [],
+                    "online_scheduling_time_s": float(summary.get("online_scheduling_time_s", 0.0)),
+                    "total_runtime_s": float(total_runtime_s),
+                    "activation_ratio": float(counts[1] / max(sub_dl.N, 1)),
+                    "candidate_comm_relay_ratio": float(summary.get("candidate_comm_relay_ratio", counts[1] / max(sub_dl.N, 1))),
+                    "actual_forward_participation_ratio": float(summary.get("actual_forward_participation_ratio", 0.0)),
+                    "actual_forward_unique_satellite_count": float(summary.get("actual_forward_unique_satellite_count", 0.0)),
+                    "actual_downlink_unique_satellite_count": float(summary.get("actual_downlink_unique_satellite_count", 0.0)),
+                    "avg_actual_isl_send_count": float(summary.get("avg_actual_isl_send_count", 0.0)),
+                    "max_actual_isl_send_count": float(summary.get("max_actual_isl_send_count", 0.0)),
+                    "avg_actual_isl_receive_count": float(summary.get("avg_actual_isl_receive_count", 0.0)),
+                    "max_actual_isl_receive_count": float(summary.get("max_actual_isl_receive_count", 0.0)),
+                    "avg_actual_downlink_count": float(summary.get("avg_actual_downlink_count", 0.0)),
+                    "max_actual_downlink_count": float(summary.get("max_actual_downlink_count", 0.0)),
+                    "avg_delivered_relay_hops": float(summary.get("avg_delivered_relay_hops", 0.0)),
+                    "max_observed_relay_hops": float(summary.get("max_observed_relay_hops", 0.0)),
+                    "dropped_ttl_mb": float(summary.get("dropped_ttl_mb", 0.0)),
+                    "dropped_melt_mb": float(summary.get("dropped_melt_mb", 0.0)),
+                    "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
+                    "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
+                    "utility": float(summary.get("utility", 0.0)),
                 }
-            _, counts, hist = engine.evaluate(
-                item["gene"],
-                track_history=False,
-                return_summary=True,
-                matcher_mode=item["matcher_mode"],
-                use_topk=item["use_topk"],
-                use_window_urgency=True,
-                use_energy_score=True,
-            )
-            summary = dict(hist.get("summary", {})) if hist else {}
-            activation_runtime_s = scale_nsga_runtime if item["activation"] == "NSGA-III" else 0.0
-            total_runtime_s = activation_runtime_s + float(summary.get("simulation_runtime_s", 0.0))
-            series[item["method_id"]]["online_scheduling_time_s"].append(float(summary.get("online_scheduling_time_s", 0.0)))
-            series[item["method_id"]]["total_runtime_s"].append(float(total_runtime_s))
-            series[item["method_id"]]["activation_ratio"].append(float(counts[1] / max(sub_dl.N, 1)))
-            series[item["method_id"]]["candidate_comm_relay_ratio"].append(float(summary.get("candidate_comm_relay_ratio", counts[1] / max(sub_dl.N, 1))))
-            series[item["method_id"]]["actual_forward_participation_ratio"].append(float(summary.get("actual_forward_participation_ratio", 0.0)))
-            series[item["method_id"]]["actual_forward_unique_satellite_count"].append(int(summary.get("actual_forward_unique_satellite_count", 0)))
-            series[item["method_id"]]["actual_downlink_unique_satellite_count"].append(int(summary.get("actual_downlink_unique_satellite_count", 0)))
-            series[item["method_id"]]["avg_actual_isl_send_count"].append(float(summary.get("avg_actual_isl_send_count", 0.0)))
-            series[item["method_id"]]["max_actual_isl_send_count"].append(int(summary.get("max_actual_isl_send_count", 0)))
-            series[item["method_id"]]["avg_actual_isl_receive_count"].append(float(summary.get("avg_actual_isl_receive_count", 0.0)))
-            series[item["method_id"]]["max_actual_isl_receive_count"].append(int(summary.get("max_actual_isl_receive_count", 0)))
-            series[item["method_id"]]["avg_actual_downlink_count"].append(float(summary.get("avg_actual_downlink_count", 0.0)))
-            series[item["method_id"]]["max_actual_downlink_count"].append(int(summary.get("max_actual_downlink_count", 0)))
-            series[item["method_id"]]["avg_delivered_relay_hops"].append(float(summary.get("avg_delivered_relay_hops", 0.0)))
-            series[item["method_id"]]["max_observed_relay_hops"].append(int(summary.get("max_observed_relay_hops", 0)))
-            series[item["method_id"]]["dropped_ttl_mb"].append(float(summary.get("dropped_ttl_mb", 0.0)))
-            series[item["method_id"]]["dropped_melt_mb"].append(float(summary.get("dropped_melt_mb", 0.0)))
-            series[item["method_id"]]["delivery_ratio"].append(float(summary.get("delivery_ratio", 0.0)))
-            series[item["method_id"]]["packet_loss_rate"].append(float(summary.get("packet_loss_rate", 0.0)))
-            series[item["method_id"]]["utility"].append(float(summary.get("utility", 0.0)))
-        print(f"  scale point nodes={sub_dl.N} completed")
+                series[item["method_id"]]["raw"].append(raw_record)
+                raw_rows.append(raw_record)
+            print(f"  scale point nodes={sub_dl.N} repeat {rep + 1}/{repeat_count} completed")
+
+    for method in series.values():
+        records = list(method.pop("raw", []))
+        for key in metric_keys:
+            vals_median = []
+            vals_q25 = []
+            vals_q75 = []
+            for n in node_targets:
+                vals = np.asarray(
+                    [float(row[key]) for row in records if int(row["satellite_count"]) == int(n)],
+                    dtype=np.float64,
+                )
+                if vals.size == 0:
+                    vals = np.asarray([0.0], dtype=np.float64)
+                vals_median.append(float(np.median(vals)))
+                vals_q25.append(float(np.quantile(vals, 0.25)))
+                vals_q75.append(float(np.quantile(vals, 0.75)))
+            method[key] = vals_median
+            method[f"{key}_q25"] = vals_q25
+            method[f"{key}_q75"] = vals_q75
 
     return {
         "nodes": [int(x) for x in node_targets],
         "methods": [series[k] for k in sorted(series.keys())],
+        "raw_rows": raw_rows,
+        "repeat_count": int(repeat_count),
+        "eval_repeats": int(eval_repeats),
+        "task_packet_mb": float(cfg.TASK_PACKET_MB),
         "definitions": {
             "delivery_ratio": "delivered_mb/TASK_DATA_MB",
             "packet_loss_rate": "dropped_mb/generated_mb",
             "online_time": "online ISL matching plus Beijing ground-station downlink selection time",
             "total_runtime": "NSGA-III sparse activation runtime plus simulation evaluation runtime for NSGA-III methods; simulation runtime only for Full activation methods",
+            "scale_statistic": "method curves use the median over deterministic satellite-subset repeats; q25/q75 columns provide the interquartile interval",
         },
     }
 
@@ -2464,34 +2576,78 @@ def run_scalability_experiment(
 def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     nodes = [int(x) for x in scale.get("nodes", [])] if scale else []
-    rows = []
+    metric_keys = [
+        "online_scheduling_time_s",
+        "total_runtime_s",
+        "activation_ratio",
+        "candidate_comm_relay_ratio",
+        "actual_forward_participation_ratio",
+        "actual_forward_unique_satellite_count",
+        "actual_downlink_unique_satellite_count",
+        "avg_actual_isl_send_count",
+        "max_actual_isl_send_count",
+        "avg_actual_isl_receive_count",
+        "max_actual_isl_receive_count",
+        "avg_actual_downlink_count",
+        "max_actual_downlink_count",
+        "avg_delivered_relay_hops",
+        "max_observed_relay_hops",
+        "dropped_ttl_mb",
+        "dropped_melt_mb",
+        "delivery_ratio",
+        "packet_loss_rate",
+        "utility",
+    ]
+    rows: List[Dict] = []
+    repeat_count = int(scale.get("repeat_count", 1)) if scale else 1
+    eval_repeats = int(scale.get("eval_repeats", 1)) if scale else 1
+    task_packet_mb = scale.get("task_packet_mb", None) if scale else None
+
+    for raw in scale.get("raw_rows", []) if scale else []:
+        row = {
+            "row_type": "repeat",
+            "statistic": "repeat",
+            "satellite_count": int(raw.get("satellite_count", 0)),
+            "repeat": int(raw.get("repeat", 0)),
+            "repeat_count": repeat_count,
+            "eval_repeats": int(raw.get("eval_repeats", eval_repeats)),
+            "task_packet_mb": task_packet_mb,
+            "method_id": raw.get("method_id", ""),
+            "method": raw.get("label", ""),
+            "activation": raw.get("activation", ""),
+            "candidate_graph": raw.get("candidate_graph", ""),
+            "matcher": raw.get("matcher", ""),
+        }
+        for key in metric_keys:
+            row[key] = raw.get(key, None)
+        rows.append(row)
+
     for method in scale.get("methods", []) if scale else []:
         for i, n in enumerate(nodes):
-            rows.append(
-                {
-                    "卫星数量": n,
-                    "方法编号": method.get("method_id", ""),
-                    "方法": method.get("label", ""),
-                    "候选通信转发节点比例": method.get("candidate_comm_relay_ratio", [None] * len(nodes))[i],
-                    "实际参与转发节点比例": method.get("actual_forward_participation_ratio", [None] * len(nodes))[i],
-                    "实际参与转发唯一卫星数": method.get("actual_forward_unique_satellite_count", [None] * len(nodes))[i],
-                    "实际下传唯一卫星数": method.get("actual_downlink_unique_satellite_count", [None] * len(nodes))[i],
-                    "平均每时刻ISL发送卫星数": method.get("avg_actual_isl_send_count", [None] * len(nodes))[i],
-                    "最大每时刻ISL发送卫星数": method.get("max_actual_isl_send_count", [None] * len(nodes))[i],
-                    "平均每时刻ISL接收卫星数": method.get("avg_actual_isl_receive_count", [None] * len(nodes))[i],
-                    "最大每时刻ISL接收卫星数": method.get("max_actual_isl_receive_count", [None] * len(nodes))[i],
-                    "平均每时刻下传卫星数": method.get("avg_actual_downlink_count", [None] * len(nodes))[i],
-                    "最大每时刻下传卫星数": method.get("max_actual_downlink_count", [None] * len(nodes))[i],
-                    "平均交付中继跳数": method.get("avg_delivered_relay_hops", [None] * len(nodes))[i],
-                    "最大观测中继跳数": method.get("max_observed_relay_hops", [None] * len(nodes))[i],
-                    "TTL丢弃数据量(MB)": method.get("dropped_ttl_mb", [None] * len(nodes))[i],
-                    "熔断丢弃数据量(MB)": method.get("dropped_melt_mb", [None] * len(nodes))[i],
-                    "在线调度时间(s)": method.get("online_scheduling_time_s", [None] * len(nodes))[i],
-                    "方法总运行时间(s)": method.get("total_runtime_s", [None] * len(nodes))[i],
-                    "交付率": method.get("delivery_ratio", [None] * len(nodes))[i],
-                    "丢包率": method.get("packet_loss_rate", [None] * len(nodes))[i],
-                }
-            )
+            row = {
+                "row_type": "aggregate",
+                "statistic": "median",
+                "satellite_count": n,
+                "repeat": "all",
+                "repeat_count": repeat_count,
+                "eval_repeats": eval_repeats,
+                "task_packet_mb": task_packet_mb,
+                "method_id": method.get("method_id", ""),
+                "method": method.get("label", ""),
+                "activation": method.get("activation", ""),
+                "candidate_graph": method.get("candidate_graph", ""),
+                "matcher": method.get("matcher", ""),
+            }
+            for key in metric_keys:
+                vals = method.get(key, [None] * len(nodes))
+                q25_vals = method.get(f"{key}_q25", [None] * len(nodes))
+                q75_vals = method.get(f"{key}_q75", [None] * len(nodes))
+                row[key] = vals[i] if i < len(vals) else None
+                row[f"{key}_median"] = vals[i] if i < len(vals) else None
+                row[f"{key}_q25"] = q25_vals[i] if i < len(q25_vals) else None
+                row[f"{key}_q75"] = q75_vals[i] if i < len(q75_vals) else None
+            rows.append(row)
+
     pd.DataFrame(rows).to_csv(out_dir / "table6_scalability_actual_participation.csv", index=False, encoding="utf-8-sig")
     print(f"  saved scalability actual participation table in {out_dir}")
 
@@ -2761,7 +2917,7 @@ def run_sparse_activation_curve_experiment(cfg: Config, dl: DataLoader, best_gen
         row["utility_q25"] = row["utility_q75"] = row["utility"]
         row["delivery_ratio_q25"] = row["delivery_ratio_q75"] = row["delivery_ratio"]
         rows.append(row)
-        print(f"  activation ratio={ratio:.1f} completed")
+        print(f"  activation ratio={ratio:.2f} completed")
     return {"rows": rows}
 
 
@@ -2781,7 +2937,19 @@ def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) 
             score_flags=flags,
         )
         summary = dict(hist.get("summary", {})) if hist else {}
-        rows.append(_summary_for_experiment(name, None, summary, counts, {"score_flags": str(flags), "scenario": "Stress"}))
+        rows.append(
+            _summary_for_experiment(
+                name,
+                None,
+                summary,
+                counts,
+                {
+                    "score_flags": str(flags),
+                    "scenario": "Ablation Stress",
+                    "task_region_weights": ",".join(f"{w:.2f}" for w in dl.task_region_weights),
+                },
+            )
+        )
         print(f"  ablation {name} completed")
     _, counts, hist = engine.evaluate(
         best_gene,
@@ -2792,7 +2960,19 @@ def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) 
         score_flags={"future_gs": False, "energy": False, "task_priority": False, "buffer_pressure": False},
     )
     summary = dict(hist.get("summary", {})) if hist else {}
-    rows.append(_summary_for_experiment("Distance Only", None, summary, counts, {"score_flags": "all cross-layer flags disabled", "scenario": "Stress"}))
+    rows.append(
+        _summary_for_experiment(
+            "Distance Only",
+            None,
+            summary,
+            counts,
+            {
+                "score_flags": "all cross-layer flags disabled",
+                "scenario": "Ablation Stress",
+                "task_region_weights": ",".join(f"{w:.2f}" for w in dl.task_region_weights),
+            },
+        )
+    )
     _, counts, hist = engine.evaluate(
         best_gene,
         return_summary=True,
@@ -2801,20 +2981,36 @@ def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) 
         use_energy_score=False,
     )
     summary = dict(hist.get("summary", {})) if hist else {}
-    rows.append(_summary_for_experiment("No Cross-layer Score", None, summary, counts, {"score_flags": "legacy distance/free/downlink score", "scenario": "Stress"}))
+    rows.append(
+        _summary_for_experiment(
+            "No Cross-layer Score",
+            None,
+            summary,
+            counts,
+            {
+                "score_flags": "legacy distance/free/downlink score",
+                "scenario": "Ablation Stress",
+                "task_region_weights": ",".join(f"{w:.2f}" for w in dl.task_region_weights),
+            },
+        )
+    )
     prop = rows[0]
     prop_u = max(abs(float(prop.get("utility", 0.0))), 1e-9)
     prop_d = float(prop.get("delivery_ratio", 0.0))
     prop_loss = float(prop.get("packet_loss_rate", 0.0))
-    prop_energy = float(prop.get("unit_delivered_energy") or 0.0)
+    prop_energy_raw = prop.get("unit_delivered_energy")
+    prop_energy = float(prop_energy_raw) if prop_energy_raw is not None and np.isfinite(float(prop_energy_raw)) else np.nan
     prop_online = float(prop.get("online_scheduling_time_s", 0.0))
     for row in rows:
         row["utility_change_pct_vs_proposed"] = (float(row.get("utility", 0.0)) - float(prop.get("utility", 0.0))) / prop_u * 100.0
         row["delivery_ratio_change_vs_proposed"] = float(row.get("delivery_ratio", 0.0)) - prop_d
         row["packet_loss_increase_vs_proposed"] = float(row.get("packet_loss_rate", 0.0)) - prop_loss
-        row["unit_energy_change_pct_vs_proposed"] = (
-            (float(row.get("unit_delivered_energy") or 0.0) - prop_energy) / max(abs(prop_energy), 1e-9) * 100.0
-        )
+        row_energy_raw = row.get("unit_delivered_energy")
+        row_energy = float(row_energy_raw) if row_energy_raw is not None and np.isfinite(float(row_energy_raw)) else np.nan
+        if np.isfinite(prop_energy) and abs(prop_energy) > 1e-9 and np.isfinite(row_energy):
+            row["unit_energy_change_pct_vs_proposed"] = (row_energy - prop_energy) / abs(prop_energy) * 100.0
+        else:
+            row["unit_energy_change_pct_vs_proposed"] = 0.0
         row["online_time_change_pct_vs_proposed"] = (
             (float(row.get("online_scheduling_time_s", 0.0)) - prop_online) / max(abs(prop_online), 1e-9) * 100.0
         )
@@ -3362,6 +3558,8 @@ class Visualizer:
         filename: str,
         log_y: bool = False,
         note: Optional[str] = None,
+        show_iqr: bool = False,
+        ylim: Optional[Tuple[float, float]] = None,
     ) -> None:
         nodes = np.asarray(scale.get("nodes", []), dtype=float)
         methods = scale.get("methods", []) if scale else []
@@ -3376,19 +3574,47 @@ class Visualizer:
                 continue
             linestyle = "-" if method.get("candidate_graph") == "Top-K Graph" else (0, (4, 2))
             plot_vals = np.maximum(vals, 1e-9) if log_y else vals
-            ax.plot(
-                nodes,
-                plot_vals,
-                marker=markers[i % len(markers)],
-                linestyle=linestyle,
-                lw=1.8,
-                ms=6.4,
-                color=method.get("color", "#777777"),
-                label=self._zh_label(method.get("label", f"M{i + 1}")),
-                alpha=0.95,
-            )
+            q25 = np.asarray(method.get(f"{metric_key}_q25", []), dtype=float)
+            q75 = np.asarray(method.get(f"{metric_key}_q75", []), dtype=float)
+            if show_iqr and len(q25) == len(nodes) and len(q75) == len(nodes):
+                q25_plot = np.maximum(q25, 1e-9) if log_y else q25
+                q75_plot = np.maximum(q75, 1e-9) if log_y else q75
+                yerr = np.vstack(
+                    [
+                        np.maximum(plot_vals - q25_plot, 0.0),
+                        np.maximum(q75_plot - plot_vals, 0.0),
+                    ]
+                )
+                ax.errorbar(
+                    nodes,
+                    plot_vals,
+                    yerr=yerr,
+                    marker=markers[i % len(markers)],
+                    linestyle=linestyle,
+                    lw=1.75,
+                    ms=6.2,
+                    capsize=2.2,
+                    elinewidth=0.85,
+                    color=method.get("color", "#777777"),
+                    label=self._zh_label(method.get("label", f"M{i + 1}")),
+                    alpha=0.95,
+                )
+            else:
+                ax.plot(
+                    nodes,
+                    plot_vals,
+                    marker=markers[i % len(markers)],
+                    linestyle=linestyle,
+                    lw=1.8,
+                    ms=6.4,
+                    color=method.get("color", "#777777"),
+                    label=self._zh_label(method.get("label", f"M{i + 1}")),
+                    alpha=0.95,
+                )
         if log_y:
             ax.set_yscale("log")
+        if ylim is not None:
+            ax.set_ylim(*ylim)
         ax.set_xlabel("卫星数量", fontsize=11)
         ax.set_ylabel(ylabel, fontsize=11)
         ax.set_title(title, fontsize=13, fontweight="bold")
@@ -3417,6 +3643,7 @@ class Visualizer:
             "图1  卫星数量与在线调度时间",
             "Fig1_Scale_Online_Scheduling_Time.png",
             log_y=True,
+            show_iqr=True,
         )
 
     def fig2_scale_total_runtime(self, scale: Dict) -> None:
@@ -3469,6 +3696,20 @@ class Visualizer:
         self._save("Fig3_Scale_Activation_Ratio.png")
 
     def fig4_scale_delivery_ratio(self, scale: Dict) -> None:
+        methods = scale.get("methods", []) if scale else []
+        delivery_values: List[float] = []
+        for method in methods:
+            for key in ("delivery_ratio_q25", "delivery_ratio", "delivery_ratio_q75"):
+                delivery_values.extend(float(v) for v in method.get(key, []) if v is not None and np.isfinite(float(v)))
+        ylim = None
+        if delivery_values:
+            lo = max(0.0, float(np.min(delivery_values)) - 0.03)
+            hi = min(1.02, float(np.max(delivery_values)) + 0.03)
+            if hi - lo < 0.10:
+                mid = 0.5 * (lo + hi)
+                lo = max(0.0, mid - 0.05)
+                hi = min(1.02, mid + 0.05)
+            ylim = (lo, hi)
         self._plot_scale_metric(
             scale,
             "delivery_ratio",
@@ -3476,6 +3717,8 @@ class Visualizer:
             "图4  Top-K稀疏候选图的交付性能权衡",
             "Fig4_Scale_Delivery_Ratio.png",
             note="交付率用于量化Top-K稀疏候选图在在线计算效率与传输性能之间的权衡。",
+            show_iqr=True,
+            ylim=ylim,
         )
 
     def fig5_nsga_pareto_front(self, X: np.ndarray, F: np.ndarray, dl: DataLoader) -> None:
@@ -3614,11 +3857,27 @@ class Visualizer:
                 axes[0].axhline(float(sub["utility"].iloc[0]), color=color, lw=2.0, ls="--", label=zh_method)
                 axes[1].axhline(float(sub["delivery_ratio"].iloc[0]), color=color, lw=2.0, ls="--", label=zh_method)
                 continue
+            if method == "Random Sparse" and {"utility_q25", "utility_q75", "delivery_ratio_q25", "delivery_ratio_q75"}.issubset(set(sub.columns)):
+                x_vals = sub["activation_ratio"].to_numpy(dtype=float)
+                utility_vals = sub["utility"].to_numpy(dtype=float)
+                delivery_vals = sub["delivery_ratio"].to_numpy(dtype=float)
+                utility_yerr = np.vstack(
+                    [
+                        np.maximum(utility_vals - sub["utility_q25"].to_numpy(dtype=float), 0.0),
+                        np.maximum(sub["utility_q75"].to_numpy(dtype=float) - utility_vals, 0.0),
+                    ]
+                )
+                delivery_yerr = np.vstack(
+                    [
+                        np.maximum(delivery_vals - sub["delivery_ratio_q25"].to_numpy(dtype=float), 0.0),
+                        np.maximum(sub["delivery_ratio_q75"].to_numpy(dtype=float) - delivery_vals, 0.0),
+                    ]
+                )
+                axes[0].errorbar(x_vals, utility_vals, yerr=utility_yerr, marker="o", lw=1.9, ms=5.4, capsize=2.0, elinewidth=0.75, color=color, label=zh_method)
+                axes[1].errorbar(x_vals, delivery_vals, yerr=delivery_yerr, marker="s", lw=1.8, ms=5.2, capsize=2.0, elinewidth=0.75, color=color, label=zh_method)
+                continue
             axes[0].plot(sub["activation_ratio"], sub["utility"], marker="o", lw=2.0, color=color, label=zh_method)
             axes[1].plot(sub["activation_ratio"], sub["delivery_ratio"], marker="s", lw=1.9, color=color, label=zh_method)
-            if method == "Random Sparse" and {"utility_q25", "utility_q75"}.issubset(set(sub.columns)):
-                axes[0].fill_between(sub["activation_ratio"], sub["utility_q25"], sub["utility_q75"], color=color, alpha=0.16, linewidth=0)
-                axes[1].fill_between(sub["activation_ratio"], sub["delivery_ratio_q25"], sub["delivery_ratio_q75"], color=color, alpha=0.16, linewidth=0)
         axes[0].set_ylabel("任务效用")
         axes[1].set_ylabel("交付率")
         axes[1].set_xlabel("通信角色激活比例")
@@ -3634,55 +3893,83 @@ class Visualizer:
             self._empty_figure("Fig10_Cross_Layer_Ablation.png", "图10  跨层评分消融实验", "没有消融实验数据。")
             return
         df = pd.DataFrame(rows)
-        metrics = [
-            ("utility", "任务效用(x10^3)", 1.0 / 1000.0, lambda v: f"{v / 1000.0:.1f}k"),
-            ("delivery_ratio", "交付率", 1.0, lambda v: f"{v:.2f}"),
-            ("packet_loss_rate", "丢包率", 1.0, lambda v: f"{v:.2f}"),
-            ("online_scheduling_time_s", "在线调度时间(s)", 1.0, lambda v: f"{v:.3f}"),
-            ("unit_delivered_energy", "单位交付能耗", 1.0, lambda v: f"{v:.1f}"),
-            ("low_power_protection_count", "低电量保护次数", 1.0, lambda v: f"{int(round(v))}"),
+        plot_specs = [
+            (
+                "utility_drop_pct",
+                "效用下降(%)",
+                -pd.to_numeric(df["utility_change_pct_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                lambda v: f"{v:+.1f}%",
+            ),
+            (
+                "delivery_drop_pp",
+                "交付率下降(pp)",
+                -pd.to_numeric(df["delivery_ratio_change_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0,
+                lambda v: f"{v:+.2f}",
+            ),
+            (
+                "loss_increase_pp",
+                "丢包率增加(pp)",
+                pd.to_numeric(df["packet_loss_increase_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0,
+                lambda v: f"{v:+.2f}",
+            ),
+            (
+                "energy_change_pct",
+                "单位交付能耗变化(%)",
+                pd.to_numeric(df["unit_energy_change_pct_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                lambda v: f"{v:+.1f}%",
+            ),
         ]
-        fig, axes = self.plt.subplots(2, 3, figsize=(14.0, 8.2))
+        fig, axes = self.plt.subplots(2, 2, figsize=(13.2, 8.0))
         axes = axes.ravel()
         x = np.arange(len(df))
         labels = [self._zh_label(label) for label in df["method"].tolist()]
-        colors = ["#D95F02" if str(label) == "本文方法" else "#5DA5DA" for label in labels]
-        for ax, (key, title, scale, fmt) in zip(axes, metrics):
-            raw_vals = pd.to_numeric(df[key], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-            vals = raw_vals * float(scale)
+        method_names = df["method"].astype(str).tolist()
+        for ax, (_key, title, vals, fmt) in zip(axes, plot_specs):
+            vals = np.asarray(vals, dtype=float)
+            colors = []
+            for method_name, val in zip(method_names, vals):
+                if method_name == "Proposed":
+                    colors.append("#8A8A8A")
+                elif method_name in {"Distance Only", "No Cross-layer Score"}:
+                    colors.append("#D95F02")
+                elif val >= 0.0:
+                    colors.append("#5DA5DA")
+                else:
+                    colors.append("#1B9E77")
             bars = ax.bar(x, vals, color=colors, edgecolor="#333333", linewidth=0.6)
             ax.axhline(0.0, color="#555555", lw=0.8, ls="--")
             ax.set_title(title, fontsize=11.0, fontweight="bold")
             ax.set_xticks(x)
             ax.set_xticklabels(labels, rotation=22, ha="right", fontsize=8.2)
+            ax.set_ylabel("相对 Proposed 的变化")
             ax.grid(True, axis="y", ls="--", alpha=0.22)
             finite_vals = vals[np.isfinite(vals)]
             if len(finite_vals) == 0:
                 finite_vals = np.array([0.0])
             y_min = min(0.0, float(np.min(finite_vals)))
             y_max = max(0.0, float(np.max(finite_vals)))
-            span = max(y_max - y_min, 1.0)
-            ax.set_ylim(y_min - 0.06 * span if y_min < 0.0 else 0.0, y_max + 0.18 * span)
-            for bar, raw, plotted in zip(bars, raw_vals, vals):
+            span = max(y_max - y_min, 0.5)
+            ax.set_ylim(y_min - 0.14 * span, y_max + 0.24 * span)
+            for bar, plotted in zip(bars, vals):
                 if plotted >= 0.0:
-                    y = plotted + 0.025 * span
+                    y = plotted + 0.035 * span
                     va = "bottom"
                 else:
-                    y = plotted - 0.025 * span
+                    y = plotted - 0.035 * span
                     va = "top"
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
                     y,
-                    fmt(float(raw)),
+                    fmt(float(plotted)),
                     ha="center",
                     va=va,
-                    fontsize=7.2,
+                    fontsize=7.4,
                     rotation=90,
                     color="#222222",
                 )
         fig.suptitle(
-            "图10  压力场景下跨层评分消融实验\n"
-            "柱状图表示各指标绝对值；零高度柱表示有效的零值，并非数据缺失。",
+            "图10  消融压力场景下跨层评分组件的相对退化\n"
+            "正值通常表示相对 Proposed 变差；绿色负值表示该指标出现局部改善。",
             fontsize=13.0,
             fontweight="bold",
         )
@@ -3996,7 +4283,26 @@ def main() -> None:
         stress_best_gene = stress_result["X"][stress_best_i].astype(bool)
         topk_exp = run_topk_sensitivity_experiment(stress_cfg, dl, stress_best_gene)
         sparse_exp = run_sparse_activation_curve_experiment(stress_cfg, dl, stress_best_gene)
-        ablation_exp = run_ablation_experiment(stress_cfg, dl, stress_best_gene)
+        ablation_cfg = make_ablation_stress_config(cfg)
+        ablation_dl = _with_task_region_weights(dl, ABLATION_TASK_REGION_WEIGHTS, ablation_cfg)
+        print("=" * 72)
+        print(
+            "S8 Ablation-only stress scenario for Fig10: "
+            f"TASK_DATA_MB={ablation_cfg.TASK_DATA_MB:.1f}, "
+            f"TX_ISL={ablation_cfg.TX_RATE_ISL:.1f}, TX_SGL={ablation_cfg.TX_RATE_SGL:.1f}, "
+            f"GS_ANTENNAS={ablation_cfg.GS_ANTENNAS}, Q_MAX={ablation_cfg.Q_MAX_COMM:.1f}, "
+            f"CACHE_TTL_S={ablation_cfg.CACHE_TTL_S:.1f}, "
+            f"weights={','.join(f'{w:.2f}' for w in ablation_dl.task_region_weights)}"
+        )
+        print("=" * 72)
+        ablation_problem = ConstellationProblem(ablation_cfg, ablation_dl)
+        ablation_result = NSGA3Solver(ablation_cfg).optimize(ablation_problem.evaluate, ablation_dl.N)
+        ablation_best_i = select_best_objective_index(
+            ablation_result["F"],
+            utility_tol=max(float(ablation_cfg.GA_CONV_EPS), 1e-6),
+        )
+        ablation_best_gene = ablation_result["X"][ablation_best_i].astype(bool)
+        ablation_exp = run_ablation_experiment(ablation_cfg, ablation_dl, ablation_best_gene)
         # Temporarily disabled: Fig11 matcher-quality calculation and table7 output.
         # matcher_exp = run_matcher_quality_experiment(scale)
         # Temporarily disabled: Fig12 energy-safety replay calculation.
