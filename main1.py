@@ -3221,13 +3221,14 @@ def save_academic_experiment_outputs(
     topk: Dict,
     sparse: Dict,
     ablation: Dict,
-    matcher: Dict,
+    matcher: Optional[Dict] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(topk.get("rows", [])).to_csv(out_dir / "table3_topk_sensitivity.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(sparse.get("rows", [])).to_csv(out_dir / "table4_sparse_activation_curve.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(ablation.get("rows", [])).to_csv(out_dir / "table5_ablation.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(matcher.get("rows", [])).to_csv(out_dir / "table7_matcher_quality.csv", index=False, encoding="utf-8-sig")
+    if matcher is not None:
+        pd.DataFrame(matcher.get("rows", [])).to_csv(out_dir / "table7_matcher_quality.csv", index=False, encoding="utf-8-sig")
     print(f"  saved academic comparison tables in {out_dir}")
 
 
@@ -3972,12 +3973,14 @@ def main() -> None:
         save_scalability_outputs(out_dir, scale)
         vis = Visualizer(out_dir)
         vis.fig1_scale_online_time(scale)
-        vis.fig2_scale_total_runtime(scale)
-        vis.fig3_scale_activation_ratio(scale)
+        # Temporarily disabled: Fig2 total runtime and Fig3 activation ratio.
+        # vis.fig2_scale_total_runtime(scale)
+        # vis.fig3_scale_activation_ratio(scale)
         vis.fig4_scale_delivery_ratio(scale)
-        vis.fig5_nsga_pareto_front(result["X"], result["F"], dl)
-        vis.fig6_nsga_convergence(result["history"])
-        vis.fig7_activation_utility_3d(result["X"], result["F"], dl, best_gene)
+        # Temporarily disabled: Fig5-Fig7 NSGA diagnostic plots.
+        # vis.fig5_nsga_pareto_front(result["X"], result["F"], dl)
+        # vis.fig6_nsga_convergence(result["history"])
+        # vis.fig7_activation_utility_3d(result["X"], result["F"], dl, best_gene)
         stress_cfg = make_stress_config(cfg)
         print("=" * 72)
         print(
@@ -3994,23 +3997,26 @@ def main() -> None:
         topk_exp = run_topk_sensitivity_experiment(stress_cfg, dl, stress_best_gene)
         sparse_exp = run_sparse_activation_curve_experiment(stress_cfg, dl, stress_best_gene)
         ablation_exp = run_ablation_experiment(stress_cfg, dl, stress_best_gene)
-        matcher_exp = run_matcher_quality_experiment(scale)
-        energy_exp = run_energy_safety_timeseries_experiment(stress_cfg, dl, stress_best_gene)
-        save_academic_experiment_outputs(out_dir, topk_exp, sparse_exp, ablation_exp, matcher_exp)
+        # Temporarily disabled: Fig11 matcher-quality calculation and table7 output.
+        # matcher_exp = run_matcher_quality_experiment(scale)
+        # Temporarily disabled: Fig12 energy-safety replay calculation.
+        # energy_exp = run_energy_safety_timeseries_experiment(stress_cfg, dl, stress_best_gene)
+        save_academic_experiment_outputs(out_dir, topk_exp, sparse_exp, ablation_exp)
         vis.fig8_topk_efficiency_performance(topk_exp)
         vis.fig9_sparse_activation_utility_curve(sparse_exp)
         vis.fig10_cross_layer_ablation(ablation_exp)
-        vis.fig11_greedy_hungarian_quality_gap(matcher_exp)
-        vis.fig12_energy_safety_timeseries(energy_exp)
-        time_budget_exp = run_time_budget_optimizer_experiment(
-            cfg,
-            dl,
-            result,
-            best_gene,
-            nsga_runtime_s=float(result.get("runtime_s", 0.0)),
-        )
-        save_time_budget_optimizer_outputs(out_dir, time_budget_exp)
-        vis.fig13_time_budget_search_comparison(time_budget_exp)
+        # Temporarily disabled: Fig11-Fig13 plotting and time-budget calculation/table8 output.
+        # vis.fig11_greedy_hungarian_quality_gap(matcher_exp)
+        # vis.fig12_energy_safety_timeseries(energy_exp)
+        # time_budget_exp = run_time_budget_optimizer_experiment(
+        #     cfg,
+        #     dl,
+        #     result,
+        #     best_gene,
+        #     nsga_runtime_s=float(result.get("runtime_s", 0.0)),
+        # )
+        # save_time_budget_optimizer_outputs(out_dir, time_budget_exp)
+        # vis.fig13_time_budget_search_comparison(time_budget_exp)
 
     print("=" * 72)
     print("Done")
