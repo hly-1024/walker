@@ -42,10 +42,15 @@ SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 1000)))
 SCALE_TOPK_FULL_PAIRINGS = (("M1", "M2"), ("M3", "M4"), ("M5", "M6"), ("M7", "M8"))
 TOPK_SENSITIVITY_VALUES = (1, 2, 3, 4, 6, 8, 10, 12)
 SPARSE_ACTIVATION_RATIOS = (
+    0.01,
     0.02,
+    0.03,
     0.04,
+    0.05,
     0.06,
+    0.07,
     0.08,
+    0.09,
     0.10,
     0.12,
     0.15,
@@ -63,12 +68,12 @@ SPARSE_ACTIVATION_RATIOS = (
     0.90,
     1.00,
 )
-SPARSE_RANDOM_REPEATS = 5
+SPARSE_RANDOM_REPEATS = 1
 STRESS_TASK_DATA_FACTOR = 1.8
 STRESS_TASK_GEN_FACTOR = 1.4
 STRESS_TX_RATE_FACTOR = 0.55
 STRESS_QUEUE_FACTOR = 0.65
-ABLATION_TASK_REGION_WEIGHTS = np.asarray((0.85, 0.05, 0.05, 0.05), dtype=np.float64)
+ABLATION_TASK_REGION_WEIGHTS = np.asarray((0.80, 0.12, 0.06, 0.02), dtype=np.float64)
 ABLATION_CONFIGS = (
     ("Proposed", {"future_gs": True, "energy": True, "task_priority": True, "buffer_pressure": True}),
     ("No Future GS", {"future_gs": False, "energy": True, "task_priority": True, "buffer_pressure": True}),
@@ -252,7 +257,11 @@ class Config:
     COMPLEXITY_REPEATS: int = 3
     COMPLEXITY_MAX_STEPS: int = 96
     BASELINE_REPEATS: int = 1
-    SCALABILITY_REPEATS: int = 3
+    EXPERIMENT_REPEAT_MODE: str = "single"
+    SCALE_MEAN_REPEATS: int = 50
+    SPARSE_MEAN_REPEATS: int = 10
+    SPARSE_REPEATS: int = 1
+    SCALABILITY_REPEATS: int = 1
     SCALABILITY_EVAL_REPEATS: int = 3
 
     T0_DOY: float = 76.0
@@ -299,23 +308,23 @@ def make_stress_config(cfg: Config) -> Config:
 def make_ablation_stress_config(cfg: Config) -> Config:
     """Create a stronger stress scenario used only by the cross-layer ablation."""
     ablation = make_stress_config(cfg)
-    ablation.TASK_DATA_MB = float(cfg.TASK_DATA_MB) * 3.0
-    ablation.TASK_GEN_RATE = float(cfg.TASK_GEN_RATE) * 2.2
-    ablation.TX_RATE_ISL = float(cfg.TX_RATE_ISL) * 0.35
-    ablation.TX_RATE_SGL = float(cfg.TX_RATE_SGL) * 0.35
-    ablation.Q_MAX_COMM = float(cfg.Q_MAX_COMM) * 0.20
-    ablation.CACHE_TTL_S = float(cfg.CACHE_TTL_S) * 0.30
+    ablation.TASK_DATA_MB = float(cfg.TASK_DATA_MB) * 3.5
+    ablation.TASK_GEN_RATE = float(cfg.TASK_GEN_RATE) * 2.5
+    ablation.TX_RATE_ISL = float(cfg.TX_RATE_ISL) * 0.30
+    ablation.TX_RATE_SGL = float(cfg.TX_RATE_SGL) * 0.30
+    ablation.Q_MAX_COMM = float(cfg.Q_MAX_COMM) * 0.15
+    ablation.CACHE_TTL_S = float(cfg.CACHE_TTL_S) * 0.25
     ablation.GS_ANTENNAS = 1
-    ablation.E_SOLAR_CHG = float(cfg.E_SOLAR_CHG) * 0.45
-    ablation.E_BASE_DRAIN = float(cfg.E_BASE_DRAIN) * 1.35
-    ablation.E_TX_DRAIN = float(cfg.E_TX_DRAIN) * 2.50
-    ablation.E_SENSE_DRAIN = float(cfg.E_SENSE_DRAIN) * 2.00
-    ablation.ADAPTIVE_K_BASE = 4
-    ablation.ADAPTIVE_K_MIN = 2
+    ablation.E_SOLAR_CHG = float(cfg.E_SOLAR_CHG) * 0.30
+    ablation.E_BASE_DRAIN = float(cfg.E_BASE_DRAIN) * 1.50
+    ablation.E_TX_DRAIN = float(cfg.E_TX_DRAIN) * 3.00
+    ablation.E_SENSE_DRAIN = float(cfg.E_SENSE_DRAIN) * 2.50
+    ablation.ADAPTIVE_K_BASE = 2
+    ablation.ADAPTIVE_K_MIN = 1
     ablation.ADAPTIVE_K_MAX = int(cfg.ADAPTIVE_K_MAX)
-    ablation.ADAPTIVE_K_ALPHA = 10.0
-    ablation.ADAPTIVE_K_BETA = 3.0
-    ablation.ADAPTIVE_K_GAMMA = 3.0
+    ablation.ADAPTIVE_K_ALPHA = 12.0
+    ablation.ADAPTIVE_K_BETA = 2.0
+    ablation.ADAPTIVE_K_GAMMA = 2.0
     return ablation
 
 
@@ -2506,11 +2515,9 @@ def run_scalability_experiment(
         "delivery_ratio",
         "packet_loss_rate",
         "utility",
-        "online_speedup_vs_full",
-        "delivery_loss_pp_vs_full",
     ]
 
-    def median_summary(summaries: List[Dict]) -> Dict:
+    def mean_summary(summaries: List[Dict]) -> Dict:
         merged: Dict = {}
         keys = sorted({key for summary in summaries for key in summary.keys()})
         for key in keys:
@@ -2520,7 +2527,7 @@ def run_scalability_experiment(
                 if isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(val, bool):
                     vals.append(float(val))
             if vals:
-                merged[key] = float(np.median(np.asarray(vals, dtype=np.float64)))
+                merged[key] = float(np.mean(np.asarray(vals, dtype=np.float64)))
         return merged
 
     for n in node_targets:
@@ -2567,7 +2574,7 @@ def run_scalability_experiment(
                         use_energy_score=True,
                     )
                     eval_summaries.append(dict(hist.get("summary", {})) if hist else {})
-                summary = median_summary(eval_summaries)
+                summary = mean_summary(eval_summaries)
                 activation_runtime_s = scale_nsga_runtime if item["activation"] == "NSGA-III" else 0.0
                 total_runtime_s = activation_runtime_s + float(summary.get("simulation_runtime_s", 0.0))
                 raw_record = {
@@ -2599,18 +2606,16 @@ def run_scalability_experiment(
                     "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
                     "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
                     "utility": float(summary.get("utility", 0.0)),
-                    "online_speedup_vs_full": np.nan,
-                    "delivery_loss_pp_vs_full": np.nan,
                 }
                 series[item["method_id"]]["raw"].append(raw_record)
                 raw_rows.append(raw_record)
             print(f"  scale point nodes={sub_dl.N} repeat {rep + 1}/{repeat_count} completed")
 
-    _annotate_scale_pair_metrics(raw_rows)
     for method in series.values():
         records = list(method.pop("raw", []))
         for key in metric_keys:
-            vals_median = []
+            vals_mean = []
+            vals_std = []
             vals_q25 = []
             vals_q75 = []
             for n in node_targets:
@@ -2620,14 +2625,18 @@ def run_scalability_experiment(
                 )
                 finite_vals = vals[np.isfinite(vals)]
                 if finite_vals.size == 0:
-                    vals_median.append(np.nan)
+                    vals_mean.append(np.nan)
+                    vals_std.append(np.nan)
                     vals_q25.append(np.nan)
                     vals_q75.append(np.nan)
                     continue
-                vals_median.append(float(np.median(finite_vals)))
+                vals_mean.append(float(np.mean(finite_vals)))
+                vals_std.append(float(np.std(finite_vals, ddof=1)) if finite_vals.size > 1 else 0.0)
                 vals_q25.append(float(np.quantile(finite_vals, 0.25)))
                 vals_q75.append(float(np.quantile(finite_vals, 0.75)))
-            method[key] = vals_median
+            method[key] = vals_mean
+            method[f"{key}_mean"] = vals_mean
+            method[f"{key}_std"] = vals_std
             method[f"{key}_q25"] = vals_q25
             method[f"{key}_q75"] = vals_q75
 
@@ -2643,7 +2652,7 @@ def run_scalability_experiment(
             "packet_loss_rate": "dropped_mb/generated_mb",
             "online_time": "online ISL matching plus Beijing ground-station downlink selection time",
             "total_runtime": "NSGA-III sparse activation runtime plus simulation evaluation runtime for NSGA-III methods; simulation runtime only for Full activation methods",
-            "scale_statistic": "method curves use the median over deterministic satellite-subset repeats; q25/q75 columns provide the interquartile interval",
+            "scale_statistic": "method curves use the mean over deterministic satellite-subset repeats; std and q25/q75 columns describe repeat variability",
         },
     }
 
@@ -2672,13 +2681,12 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
         "delivery_ratio",
         "packet_loss_rate",
         "utility",
-        "online_speedup_vs_full",
-        "delivery_loss_pp_vs_full",
     ]
     rows: List[Dict] = []
     repeat_count = int(scale.get("repeat_count", 1)) if scale else 1
     eval_repeats = int(scale.get("eval_repeats", 1)) if scale else 1
     task_packet_mb = scale.get("task_packet_mb", None) if scale else None
+    aggregate_statistic = "single" if repeat_count <= 1 else "mean"
 
     for raw in scale.get("raw_rows", []) if scale else []:
         row = {
@@ -2694,7 +2702,6 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
             "activation": raw.get("activation", ""),
             "candidate_graph": raw.get("candidate_graph", ""),
             "matcher": raw.get("matcher", ""),
-            "paired_full_method_id": raw.get("paired_full_method_id", ""),
         }
         for key in metric_keys:
             row[key] = raw.get(key, None)
@@ -2704,7 +2711,7 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
         for i, n in enumerate(nodes):
             row = {
                 "row_type": "aggregate",
-                "statistic": "median",
+                "statistic": aggregate_statistic,
                 "satellite_count": n,
                 "repeat": "all",
                 "repeat_count": repeat_count,
@@ -2715,16 +2722,16 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
                 "activation": method.get("activation", ""),
                 "candidate_graph": method.get("candidate_graph", ""),
                 "matcher": method.get("matcher", ""),
-                "paired_full_method_id": {
-                    topk_id: full_id for full_id, topk_id in SCALE_TOPK_FULL_PAIRINGS
-                }.get(str(method.get("method_id", "")), ""),
             }
             for key in metric_keys:
                 vals = method.get(key, [None] * len(nodes))
+                mean_vals = method.get(f"{key}_mean", vals)
+                std_vals = method.get(f"{key}_std", [None] * len(nodes))
                 q25_vals = method.get(f"{key}_q25", [None] * len(nodes))
                 q75_vals = method.get(f"{key}_q75", [None] * len(nodes))
                 row[key] = vals[i] if i < len(vals) else None
-                row[f"{key}_median"] = vals[i] if i < len(vals) else None
+                row[f"{key}_mean"] = mean_vals[i] if i < len(mean_vals) else None
+                row[f"{key}_std"] = std_vals[i] if i < len(std_vals) else None
                 row[f"{key}_q25"] = q25_vals[i] if i < len(q25_vals) else None
                 row[f"{key}_q75"] = q75_vals[i] if i < len(q75_vals) else None
             rows.append(row)
@@ -2771,12 +2778,21 @@ def _summary_for_experiment(method: str, ratio: Optional[float], summary: Dict, 
         "comm_active_count": int(counts[1]),
         "utility": float(summary.get("utility", 0.0)),
         "delivery_utility": float(summary.get("delivery_utility", 0.0)),
+        "delivered_mb": float(summary.get("delivered_mb", 0.0)),
+        "generated_mb": float(summary.get("generated_mb", 0.0)),
+        "dropped_mb": float(summary.get("dropped_mb", 0.0)),
         "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
         "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
+        "avg_queue_backlog_mb": float(summary.get("avg_queue_backlog_mb", 0.0)),
+        "final_buffer_mb": float(summary.get("final_buffer_mb", 0.0)),
         "online_scheduling_time_s": float(summary.get("online_scheduling_time_s", 0.0)),
         "simulation_runtime_s": float(summary.get("simulation_runtime_s", 0.0)),
+        "total_energy_demand": float(summary.get("total_energy_demand", 0.0)),
         "unit_delivered_energy": summary.get("unit_delivered_energy"),
+        "avg_remaining_energy": float(summary.get("avg_remaining_energy", 0.0)),
+        "min_remaining_energy": float(summary.get("min_remaining_energy", 0.0)),
         "low_power_protection_count": int(summary.get("low_power_protection_count", 0)),
+        "melt_count": int(summary.get("melt_count", 0)),
         "candidate_comm_relay_ratio": float(summary.get("candidate_comm_relay_ratio", 0.0)),
         "actual_forward_unique_satellite_count": int(summary.get("actual_forward_unique_satellite_count", 0)),
         "actual_forward_participation_ratio": float(summary.get("actual_forward_participation_ratio", 0.0)),
@@ -2932,7 +2948,44 @@ def run_sparse_activation_curve_experiment(cfg: Config, dl: DataLoader, best_gen
     base_sense = int(best_gene[:n_sat].sum())
     base_comm = int((best_gene[n_sat:] | best_gene[:n_sat]).sum())
     sense_fraction = float(np.clip(base_sense / max(base_comm, 1), 0.10, 0.75))
+    repeat_count = int(max(1, getattr(cfg, "SPARSE_REPEATS", SPARSE_RANDOM_REPEATS)))
+    aggregate_statistic = "single" if repeat_count <= 1 else "mean"
     rows: List[Dict] = []
+    raw_rows: List[Dict] = []
+
+    def add_repeat_row(row: Dict, rep: int) -> None:
+        row["row_type"] = "repeat"
+        row["statistic"] = "repeat"
+        row["repeat"] = int(rep)
+        row["repeat_count"] = int(repeat_count)
+        raw_rows.append(row)
+
+    def aggregate_repeat_rows(method: str, ratio: float, method_rows: List[Dict]) -> Dict:
+        df = pd.DataFrame(method_rows)
+        out = {
+            "row_type": "aggregate",
+            "statistic": aggregate_statistic,
+            "repeat": "all",
+            "repeat_count": int(repeat_count),
+            "method": method,
+            "activation_ratio": float(ratio),
+            "scenario": str(method_rows[0].get("scenario", "Stress")) if method_rows else "Stress",
+        }
+        if "optimizer" in df.columns:
+            out["optimizer"] = str(df["optimizer"].dropna().iloc[0]) if not df["optimizer"].dropna().empty else ""
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        for col in numeric_cols:
+            if col in {"repeat", "repeat_count"}:
+                continue
+            vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
+            if vals.size == 0:
+                continue
+            out[col] = float(np.mean(vals))
+            out[f"{col}_mean"] = float(np.mean(vals))
+            out[f"{col}_std"] = float(np.std(vals, ddof=1)) if vals.size > 1 else 0.0
+            out[f"{col}_q25"] = float(np.quantile(vals, 0.25))
+            out[f"{col}_q75"] = float(np.quantile(vals, 0.75))
+        return out
 
     full_gene = np.ones(2 * n_sat, dtype=bool)
     _, full_counts, full_hist = engine.evaluate(full_gene, return_summary=True, matcher_mode="hungarian", use_topk=True)
@@ -2943,64 +2996,53 @@ def run_sparse_activation_curve_experiment(cfg: Config, dl: DataLoader, best_gen
         sense_count = int(np.clip(round(comm_count * sense_fraction), 1, comm_count))
 
         random_rows = []
-        for rep in range(SPARSE_RANDOM_REPEATS):
+        for rep in range(repeat_count):
             comm_idx = rng.choice(n_sat, comm_count, replace=False)
             sense_idx = rng.choice(comm_idx, sense_count, replace=False)
             gene = _make_gene(n_sat, sense_idx, comm_idx)
             _, counts, hist = engine.evaluate(gene, return_summary=True, matcher_mode="hungarian", use_topk=True)
             summary = dict(hist.get("summary", {})) if hist else {}
-            random_rows.append(_summary_for_experiment("Random Sparse", ratio, summary, counts, {"repeat": rep + 1}))
-        random_df = pd.DataFrame(random_rows)
-        median_random = random_df.median(numeric_only=True).to_dict()
-        rows.append(
-            {
-                "method": "Random Sparse",
-                "activation_ratio": float(ratio),
-                "sense_active_count": int(median_random.get("sense_active_count", sense_count)),
-                "comm_active_count": int(median_random.get("comm_active_count", comm_count)),
-                "utility": float(median_random.get("utility", 0.0)),
-                "utility_q25": float(random_df["utility"].quantile(0.25)),
-                "utility_q75": float(random_df["utility"].quantile(0.75)),
-                "delivery_ratio": float(median_random.get("delivery_ratio", 0.0)),
-                "delivery_ratio_q25": float(random_df["delivery_ratio"].quantile(0.25)),
-                "delivery_ratio_q75": float(random_df["delivery_ratio"].quantile(0.75)),
-                "packet_loss_rate": float(median_random.get("packet_loss_rate", 0.0)),
-                "online_scheduling_time_s": float(median_random.get("online_scheduling_time_s", 0.0)),
-                "simulation_runtime_s": float(median_random.get("simulation_runtime_s", 0.0)),
-                "scenario": "Stress",
-            }
-        )
+            row = _summary_for_experiment("Random Sparse", ratio, summary, counts, {"scenario": "Stress"})
+            add_repeat_row(row, rep + 1)
+            random_rows.append(row)
+        rows.append(aggregate_repeat_rows("Random Sparse", float(ratio), random_rows))
 
         comm_idx = order[:comm_count]
         sense_idx = comm_idx[np.argsort(-scores[comm_idx])[:sense_count]]
         heuristic_gene = _make_gene(n_sat, sense_idx, comm_idx)
-        _, counts, hist = engine.evaluate(heuristic_gene, return_summary=True, matcher_mode="hungarian", use_topk=True)
-        summary = dict(hist.get("summary", {})) if hist else {}
-        row = _summary_for_experiment("Coverage Heuristic", ratio, summary, counts, {"scenario": "Stress"})
-        row["utility_q25"] = row["utility_q75"] = row["utility"]
-        row["delivery_ratio_q25"] = row["delivery_ratio_q75"] = row["delivery_ratio"]
-        rows.append(row)
+        heuristic_rows = []
+        for rep in range(repeat_count):
+            _, counts, hist = engine.evaluate(heuristic_gene, return_summary=True, matcher_mode="hungarian", use_topk=True)
+            summary = dict(hist.get("summary", {})) if hist else {}
+            row = _summary_for_experiment("Coverage Heuristic", ratio, summary, counts, {"scenario": "Stress"})
+            add_repeat_row(row, rep + 1)
+            heuristic_rows.append(row)
+        rows.append(aggregate_repeat_rows("Coverage Heuristic", float(ratio), heuristic_rows))
 
-        nsga_gene, nsga_meta = _budget_constrained_nsga_gene(
-            cfg,
-            dl,
-            comm_count,
-            sense_fraction,
-            seed=int(cfg.RNG_SEED) + int(round(ratio * 1000)),
-        )
-        _, counts, hist = engine.evaluate(nsga_gene, return_summary=True, matcher_mode="hungarian", use_topk=True)
-        summary = dict(hist.get("summary", {})) if hist else {}
-        row = _summary_for_experiment("Budget-constrained NSGA-III", ratio, summary, counts, {**nsga_meta, "scenario": "Stress"})
-        row["utility_q25"] = row["utility_q75"] = row["utility"]
-        row["delivery_ratio_q25"] = row["delivery_ratio_q75"] = row["delivery_ratio"]
-        rows.append(row)
+        nsga_rows = []
+        for rep in range(repeat_count):
+            nsga_gene, nsga_meta = _budget_constrained_nsga_gene(
+                cfg,
+                dl,
+                comm_count,
+                sense_fraction,
+                seed=int(cfg.RNG_SEED) + int(round(ratio * 1000)) + 100003 * rep,
+            )
+            _, counts, hist = engine.evaluate(nsga_gene, return_summary=True, matcher_mode="hungarian", use_topk=True)
+            summary = dict(hist.get("summary", {})) if hist else {}
+            row = _summary_for_experiment("Budget-constrained NSGA-III", ratio, summary, counts, {**nsga_meta, "scenario": "Stress"})
+            add_repeat_row(row, rep + 1)
+            nsga_rows.append(row)
+        rows.append(aggregate_repeat_rows("Budget-constrained NSGA-III", float(ratio), nsga_rows))
 
-        row = _summary_for_experiment("Full Activation Reference", ratio, full_summary, full_counts, {"scenario": "Stress"})
-        row["utility_q25"] = row["utility_q75"] = row["utility"]
-        row["delivery_ratio_q25"] = row["delivery_ratio_q75"] = row["delivery_ratio"]
-        rows.append(row)
+        full_rows = []
+        for rep in range(repeat_count):
+            row = _summary_for_experiment("Full Activation Reference", ratio, full_summary, full_counts, {"scenario": "Stress"})
+            add_repeat_row(row, rep + 1)
+            full_rows.append(row)
+        rows.append(aggregate_repeat_rows("Full Activation Reference", float(ratio), full_rows))
         print(f"  activation ratio={ratio:.2f} completed")
-    return {"rows": rows}
+    return {"rows": rows, "raw_rows": raw_rows}
 
 
 def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) -> Dict:
@@ -3081,6 +3123,10 @@ def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) 
     prop_delivery_u = max(abs(float(prop.get("delivery_utility", 0.0))), 1e-9)
     prop_d = float(prop.get("delivery_ratio", 0.0))
     prop_loss = float(prop.get("packet_loss_rate", 0.0))
+    prop_ttl = float(prop.get("dropped_ttl_mb", 0.0))
+    prop_low_power = float(prop.get("low_power_protection_count", 0.0))
+    prop_final_buffer = float(prop.get("final_buffer_mb", 0.0))
+    prop_avg_queue = float(prop.get("avg_queue_backlog_mb", 0.0))
     prop_energy_raw = prop.get("unit_delivered_energy")
     prop_energy = float(prop_energy_raw) if prop_energy_raw is not None and np.isfinite(float(prop_energy_raw)) else np.nan
     prop_online = float(prop.get("online_scheduling_time_s", 0.0))
@@ -3091,6 +3137,15 @@ def run_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) 
         )
         row["delivery_ratio_change_vs_proposed"] = float(row.get("delivery_ratio", 0.0)) - prop_d
         row["packet_loss_increase_vs_proposed"] = float(row.get("packet_loss_rate", 0.0)) - prop_loss
+        row["ttl_drop_increase_mb_vs_proposed"] = float(row.get("dropped_ttl_mb", 0.0)) - prop_ttl
+        row["ttl_drop_change_pct_vs_proposed"] = (
+            (float(row.get("dropped_ttl_mb", 0.0)) - prop_ttl) / max(abs(prop_ttl), 1e-9) * 100.0
+            if abs(prop_ttl) > 1e-9
+            else 0.0
+        )
+        row["low_power_change_vs_proposed"] = float(row.get("low_power_protection_count", 0.0)) - prop_low_power
+        row["final_buffer_change_mb_vs_proposed"] = float(row.get("final_buffer_mb", 0.0)) - prop_final_buffer
+        row["avg_queue_backlog_change_mb_vs_proposed"] = float(row.get("avg_queue_backlog_mb", 0.0)) - prop_avg_queue
         row_energy_raw = row.get("unit_delivered_energy")
         row_energy = float(row_energy_raw) if row_energy_raw is not None and np.isfinite(float(row_energy_raw)) else np.nan
         if np.isfinite(prop_energy) and abs(prop_energy) > 1e-9 and np.isfinite(row_energy):
@@ -3507,7 +3562,8 @@ def save_academic_experiment_outputs(
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(topk.get("rows", [])).to_csv(out_dir / "table3_topk_sensitivity.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(sparse.get("rows", [])).to_csv(out_dir / "table4_sparse_activation_curve.csv", index=False, encoding="utf-8-sig")
+    sparse_table_rows = list(sparse.get("raw_rows", [])) + list(sparse.get("rows", []))
+    pd.DataFrame(sparse_table_rows).to_csv(out_dir / "table4_sparse_activation_curve.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(ablation.get("rows", [])).to_csv(out_dir / "table5_ablation.csv", index=False, encoding="utf-8-sig")
     if matcher is not None:
         pd.DataFrame(matcher.get("rows", [])).to_csv(out_dir / "table7_matcher_quality.csv", index=False, encoding="utf-8-sig")
@@ -3824,7 +3880,7 @@ class Visualizer:
             show_iqr=True,
         )
 
-    def fig1_scale_online_time(self, scale: Dict) -> None:
+    def _fig1_scale_online_time_pair_legacy(self, scale: Dict) -> None:
         nodes = np.asarray(scale.get("nodes", []), dtype=float)
         methods = scale.get("methods", []) if scale else []
         if len(nodes) == 0 or not methods:
@@ -3852,6 +3908,16 @@ class Visualizer:
         axes[1].set_xlabel("卫星数量", fontsize=11)
         fig.suptitle("图1  卫星数量与在线调度时间", fontsize=13, fontweight="bold")
         self._save("Fig1_Scale_Online_Scheduling_Time.png")
+
+    def fig1_scale_online_time(self, scale: Dict) -> None:
+        self._plot_scale_metric(
+            scale,
+            "online_scheduling_time_s",
+            "在线调度时间(s)",
+            "图1  卫星数量与在线调度时间",
+            "Fig1_Scale_Online_Scheduling_Time.png",
+            log_y=True,
+        )
 
     def fig2_scale_total_runtime(self, scale: Dict) -> None:
         self._plot_scale_metric(
@@ -3928,7 +3994,7 @@ class Visualizer:
             ylim=ylim,
         )
 
-    def fig4_scale_delivery_ratio(self, scale: Dict) -> None:
+    def _fig4_scale_delivery_ratio_pair_legacy(self, scale: Dict) -> None:
         nodes = np.asarray(scale.get("nodes", []), dtype=float)
         methods = scale.get("methods", []) if scale else []
         if len(nodes) == 0 or not methods:
@@ -3969,6 +4035,31 @@ class Visualizer:
         axes[1].set_xlabel("卫星数量", fontsize=11)
         fig.suptitle("图4  Top-K稀疏候选图的交付性能权衡", fontsize=13, fontweight="bold")
         self._save("Fig4_Scale_Delivery_Ratio.png")
+
+    def fig4_scale_delivery_ratio(self, scale: Dict) -> None:
+        methods = scale.get("methods", []) if scale else []
+        delivery_values: List[float] = []
+        for method in methods:
+            for key in ("delivery_ratio", "delivery_ratio_q25", "delivery_ratio_q75"):
+                delivery_values.extend(float(v) for v in method.get(key, []) if v is not None and np.isfinite(float(v)))
+        ylim = None
+        if delivery_values:
+            lo = max(0.0, float(np.min(delivery_values)) - 0.03)
+            hi = min(1.02, float(np.max(delivery_values)) + 0.03)
+            if hi - lo < 0.10:
+                mid = 0.5 * (lo + hi)
+                lo = max(0.0, mid - 0.05)
+                hi = min(1.02, mid + 0.05)
+            ylim = (lo, hi)
+        self._plot_scale_metric(
+            scale,
+            "delivery_ratio",
+            "交付率",
+            "图4  Top-K稀疏候选图的交付性能权衡",
+            "Fig4_Scale_Delivery_Ratio.png",
+            note="交付率用于量化Top-K稀疏候选图在在线计算效率与传输性能之间的权衡。",
+            ylim=ylim,
+        )
 
     def fig5_nsga_pareto_front(self, X: np.ndarray, F: np.ndarray, dl: DataLoader) -> None:
         if X.size == 0 or F.size == 0:
@@ -4136,7 +4227,7 @@ class Visualizer:
             ax.legend(loc="best", fontsize=8.8, framealpha=0.96)
         self._save("Fig9_Sparse_Activation_Utility_Curve.png")
 
-    def fig9_sparse_activation_utility_curve(self, sparse: Dict) -> None:
+    def _fig9_sparse_activation_delivery_curve_errorbar_legacy(self, sparse: Dict) -> None:
         rows = sparse.get("rows", []) if sparse else []
         if not rows:
             self._empty_figure("Fig9_Sparse_Activation_Utility_Curve.png", "图9  稀疏激活率与交付率", "没有稀疏激活数据。")
@@ -4187,6 +4278,43 @@ class Visualizer:
         ax.legend(loc="best", fontsize=8.8, framealpha=0.96)
         self._save("Fig9_Sparse_Activation_Utility_Curve.png")
 
+    def fig9_sparse_activation_utility_curve(self, sparse: Dict) -> None:
+        rows = sparse.get("rows", []) if sparse else []
+        if not rows:
+            self._empty_figure("Fig9_Sparse_Activation_Utility_Curve.png", "图9  稀疏激活率与交付率", "没有稀疏激活数据。")
+            return
+        df = pd.DataFrame(rows)
+        methods = list(df["method"].drop_duplicates())
+        colors = {
+            "Random Sparse": "#7A7A7A",
+            "Coverage Heuristic": "#1B9E77",
+            "Budget-constrained NSGA-III": "#1F78B4",
+            "Full Activation Reference": "#D95F02",
+        }
+        fig, ax = self.plt.subplots(figsize=(10.5, 5.8))
+        for method in methods:
+            sub = df[df["method"] == method].sort_values("activation_ratio")
+            color = colors.get(method, None)
+            zh_method = self._zh_label(method)
+            if method == "Full Activation Reference":
+                ax.axhline(float(sub["delivery_ratio"].iloc[0]), color=color, lw=2.0, ls="--", label=zh_method)
+                continue
+            ax.plot(
+                sub["activation_ratio"],
+                sub["delivery_ratio"],
+                marker="s",
+                lw=1.9,
+                ms=5.2,
+                color=color,
+                label=zh_method,
+            )
+        ax.set_ylabel("交付率")
+        ax.set_xlabel("通信角色激活比例")
+        ax.set_title("图9  压力场景下稀疏激活率与交付率", fontsize=13, fontweight="bold")
+        ax.grid(True, ls="--", alpha=0.25)
+        ax.legend(loc="best", fontsize=8.8, framealpha=0.96)
+        self._save("Fig9_Sparse_Activation_Utility_Curve.png")
+
     def fig10_cross_layer_ablation(self, ablation: Dict) -> None:
         rows = ablation.get("rows", []) if ablation else []
         if not rows:
@@ -4196,29 +4324,45 @@ class Visualizer:
         utility_change_key = "delivery_utility_change_pct_vs_proposed"
         if utility_change_key not in df.columns:
             utility_change_key = "utility_change_pct_vs_proposed"
+        def numeric_column(name: str) -> np.ndarray:
+            if name not in df.columns:
+                return np.zeros(len(df), dtype=np.float64)
+            return pd.to_numeric(df[name], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+
+        ttl_drop_increase = numeric_column("ttl_drop_increase_mb_vs_proposed")
+        low_power_change = numeric_column("low_power_change_vs_proposed")
+        if np.nanmax(np.abs(ttl_drop_increase[1:])) > 1e-9 if len(ttl_drop_increase) > 1 else False:
+            mechanism_spec = (
+                "ttl_drop_increase_mb",
+                "TTL过期丢弃增加(MB)",
+                ttl_drop_increase,
+                lambda v: f"{v:+.0f}",
+            )
+        else:
+            mechanism_spec = (
+                "low_power_change",
+                "低电量保护事件变化",
+                low_power_change,
+                lambda v: f"{v:+.0f}",
+            )
         plot_specs = [
             (
                 "weighted_utility_drop_pct",
                 "加权效用下降(%)",
-                -pd.to_numeric(df[utility_change_key], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                -numeric_column(utility_change_key),
                 lambda v: f"{v:+.1f}%",
             ),
+            mechanism_spec,
             (
-                "delivery_drop_pp",
-                "交付率下降(pp)",
-                -pd.to_numeric(df["delivery_ratio_change_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0,
-                lambda v: f"{v:+.2f}",
-            ),
-            (
-                "loss_increase_pp",
-                "丢包率增加(pp)",
-                pd.to_numeric(df["packet_loss_increase_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0,
-                lambda v: f"{v:+.2f}",
+                "unit_energy_change_pct",
+                "单位交付能耗变化(%)",
+                numeric_column("unit_energy_change_pct_vs_proposed"),
+                lambda v: f"{v:+.1f}%",
             ),
             (
                 "online_time_change_pct",
                 "在线调度时间变化(%)",
-                pd.to_numeric(df["online_time_change_pct_vs_proposed"], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                numeric_column("online_time_change_pct_vs_proposed"),
                 lambda v: f"{v:+.1f}%",
             ),
         ]
@@ -4434,6 +4578,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--arrival", choices=["fixed", "poisson"], default=None)
     parser.add_argument("--task-packet-mb", type=float, default=None)
+    parser.add_argument("--experiment-repeat-mode", choices=["single", "mean"], default=None)
     parser.add_argument("--scale-repeats", type=int, default=None)
     parser.add_argument("--scale-eval-repeats", type=int, default=None)
     parser.add_argument("--no-plots", action="store_true")
@@ -4462,6 +4607,19 @@ def main() -> None:
         cfg.TASK_ARRIVAL_MODE = str(args.arrival)
     if args.task_packet_mb is not None:
         cfg.TASK_PACKET_MB = float(args.task_packet_mb)
+    if args.experiment_repeat_mode is not None:
+        cfg.EXPERIMENT_REPEAT_MODE = str(args.experiment_repeat_mode)
+    cfg.EXPERIMENT_REPEAT_MODE = str(cfg.EXPERIMENT_REPEAT_MODE).strip().lower()
+    if cfg.EXPERIMENT_REPEAT_MODE == "mean":
+        cfg.SCALABILITY_REPEATS = int(max(1, cfg.SCALE_MEAN_REPEATS))
+        cfg.SCALABILITY_EVAL_REPEATS = 1
+        cfg.SPARSE_REPEATS = int(max(1, cfg.SPARSE_MEAN_REPEATS))
+    elif cfg.EXPERIMENT_REPEAT_MODE == "single":
+        cfg.SCALABILITY_REPEATS = 1
+        cfg.SCALABILITY_EVAL_REPEATS = 1
+        cfg.SPARSE_REPEATS = 1
+    else:
+        raise ValueError(f"unknown EXPERIMENT_REPEAT_MODE={cfg.EXPERIMENT_REPEAT_MODE!r}; use single or mean")
     if args.scale_repeats is not None:
         cfg.SCALABILITY_REPEATS = int(max(1, args.scale_repeats))
     if args.scale_eval_repeats is not None:
@@ -4486,6 +4644,11 @@ def main() -> None:
         "task arrival model: "
         f"{cfg.TASK_ARRIVAL_MODE}, packet={cfg.TASK_PACKET_MB:.1f} MB, "
         f"expected_rate={cfg.TASK_GEN_RATE:.1f} MB/s"
+    )
+    print(
+        "experiment repeat mode: "
+        f"{cfg.EXPERIMENT_REPEAT_MODE}, scale_repeats={cfg.SCALABILITY_REPEATS}, "
+        f"scale_eval_repeats={cfg.SCALABILITY_EVAL_REPEATS}, sparse_repeats={cfg.SPARSE_REPEATS}"
     )
 
     t0 = time.perf_counter()
