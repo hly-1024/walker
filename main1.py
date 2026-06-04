@@ -40,6 +40,7 @@ TASK_REGIONS = (
 
 SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 1000)))
 SCALE_TOPK_FULL_PAIRINGS = (("M1", "M2"), ("M3", "M4"), ("M5", "M6"), ("M7", "M8"))
+SCALE_HUNGARIAN_METHOD_IDS = ("M3", "M4", "M7", "M8")
 TOPK_SENSITIVITY_VALUES = (1, 2, 3, 4, 6, 8, 10, 12)
 SPARSE_ACTIVATION_RATIOS = (
     0.01,
@@ -1037,12 +1038,18 @@ class SimulationEngine:
         batch_queues: Dict[Tuple[int, int], deque],
         sat: int,
         amount: float,
+        current_time_s: float,
         prioritize_task: bool = True,
-    ) -> Tuple[float, np.ndarray, float, int]:
-        moved_total, moved_by_region, _moved_batches, hop_sum, max_hop = self._deplete_batch_queue(
+    ) -> Tuple[float, np.ndarray, float, int, float]:
+        moved_total, moved_by_region, moved_batches, hop_sum, max_hop = self._deplete_batch_queue(
             batch_queues, q_region, sat, amount, forward=False, prioritize_task=prioritize_task
         )
-        return moved_total, moved_by_region, float(hop_sum), int(max_hop)
+        latency_weighted_sum = 0.0
+        for batches in moved_batches.values():
+            for batch in batches:
+                latency_s = max(0.0, float(current_time_s) - float(batch.get("born_time_s", current_time_s)))
+                latency_weighted_sum += float(batch.get("amount", 0.0)) * latency_s
+        return moved_total, moved_by_region, float(hop_sum), int(max_hop), float(latency_weighted_sum)
 
     def _edge_scores(
         self,
@@ -1330,6 +1337,7 @@ class SimulationEngine:
                 "avg_actual_downlink_count": 0.0,
                 "max_actual_downlink_count": 0,
                 "avg_delivered_relay_hops": 0.0,
+                "avg_delivery_latency_s": 0.0,
                 "max_observed_relay_hops": 0,
                 "total_energy_demand": 0.0,
                 "unit_delivered_energy": None,
@@ -1375,6 +1383,8 @@ class SimulationEngine:
         actual_downlink_counts: List[int] = []
         delivered_hop_sum = 0.0
         delivered_hop_amount = 0.0
+        delivered_latency_weighted_sum = 0.0
+        delivered_latency_amount = 0.0
         max_observed_relay_hops = 0
         candidate_comm_relay_ratio = float(n_comm / max(dl.N, 1))
 
@@ -1515,11 +1525,12 @@ class SimulationEngine:
                     tx = min(q_total[sat], tx_sgl)
                     if tx <= 0.0:
                         continue
-                    actual_tx, delivered_regions, hop_sum, max_hop = self._deplete_downlink_queue(
+                    actual_tx, delivered_regions, hop_sum, max_hop, latency_sum = self._deplete_downlink_queue(
                         q_region,
                         batch_queues,
                         int(sat),
                         tx,
+                        float(dl.times_s[t]),
                         prioritize_task=self._score_flag(score_flags, "task_priority"),
                     )
                     if actual_tx <= 0.0:
@@ -1529,6 +1540,8 @@ class SimulationEngine:
                     delivered_by_region += delivered_regions
                     delivered_hop_sum += float(hop_sum)
                     delivered_hop_amount += float(actual_tx)
+                    delivered_latency_weighted_sum += float(latency_sum)
+                    delivered_latency_amount += float(actual_tx)
                     max_observed_relay_hops = max(int(max_observed_relay_hops), int(max_hop))
                     e[sat] = max(0.0, e[sat] - self.e_tx)
                     total_energy_demand += self.e_tx
@@ -1577,6 +1590,9 @@ class SimulationEngine:
         actual_forward_ratio = float(actual_forward_unique_count / max(dl.N, 1))
         actual_downlink_unique_count = int(len(actual_downlink_unique))
         avg_delivered_hops = float(delivered_hop_sum / delivered_hop_amount) if delivered_hop_amount > 1e-9 else 0.0
+        avg_delivery_latency_s = (
+            float(delivered_latency_weighted_sum / delivered_latency_amount) if delivered_latency_amount > 1e-9 else 0.0
+        )
         summary = {
             "delivered_mb": float(delivered),
             "delivery_ratio": float(min(delivered / max(cfg.TASK_DATA_MB, 1e-9), 1.0)),
@@ -1609,6 +1625,7 @@ class SimulationEngine:
             "avg_actual_downlink_count": float(down_counts.mean()) if down_counts.size else 0.0,
             "max_actual_downlink_count": int(down_counts.max()) if down_counts.size else 0,
             "avg_delivered_relay_hops": avg_delivered_hops,
+            "avg_delivery_latency_s": avg_delivery_latency_s,
             "max_observed_relay_hops": int(max_observed_relay_hops),
             "total_energy_demand": float(total_energy_demand),
             "unit_delivered_energy": float(total_energy_demand / delivered) if delivered > 1e-9 else None,
@@ -2509,6 +2526,7 @@ def run_scalability_experiment(
         "avg_actual_downlink_count",
         "max_actual_downlink_count",
         "avg_delivered_relay_hops",
+        "avg_delivery_latency_s",
         "max_observed_relay_hops",
         "dropped_ttl_mb",
         "dropped_melt_mb",
@@ -2600,6 +2618,7 @@ def run_scalability_experiment(
                     "avg_actual_downlink_count": float(summary.get("avg_actual_downlink_count", 0.0)),
                     "max_actual_downlink_count": float(summary.get("max_actual_downlink_count", 0.0)),
                     "avg_delivered_relay_hops": float(summary.get("avg_delivered_relay_hops", 0.0)),
+                    "avg_delivery_latency_s": float(summary.get("avg_delivery_latency_s", 0.0)),
                     "max_observed_relay_hops": float(summary.get("max_observed_relay_hops", 0.0)),
                     "dropped_ttl_mb": float(summary.get("dropped_ttl_mb", 0.0)),
                     "dropped_melt_mb": float(summary.get("dropped_melt_mb", 0.0)),
@@ -2651,6 +2670,7 @@ def run_scalability_experiment(
             "delivery_ratio": "delivered_mb/TASK_DATA_MB",
             "packet_loss_rate": "dropped_mb/generated_mb",
             "online_time": "online ISL matching plus Beijing ground-station downlink selection time",
+            "avg_delivery_latency_s": "MB-weighted average end-to-end delay from sensing-batch generation to Beijing ground-station downlink",
             "total_runtime": "NSGA-III sparse activation runtime plus simulation evaluation runtime for NSGA-III methods; simulation runtime only for Full activation methods",
             "scale_statistic": "method curves use the mean over deterministic satellite-subset repeats; std and q25/q75 columns describe repeat variability",
         },
@@ -2675,6 +2695,7 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
         "avg_actual_downlink_count",
         "max_actual_downlink_count",
         "avg_delivered_relay_hops",
+        "avg_delivery_latency_s",
         "max_observed_relay_hops",
         "dropped_ttl_mb",
         "dropped_melt_mb",
@@ -3691,6 +3712,13 @@ class Visualizer:
         ax.axis("off")
         self._save(name)
 
+    @staticmethod
+    def _filter_scale_methods(scale: Dict, method_ids: Tuple[str, ...] = SCALE_HUNGARIAN_METHOD_IDS) -> Dict:
+        filtered = dict(scale or {})
+        wanted = set(method_ids)
+        filtered["methods"] = [method for method in filtered.get("methods", []) if str(method.get("method_id", "")) in wanted]
+        return filtered
+
     def _plot_scale_metric(
         self,
         scale: Dict,
@@ -3911,7 +3939,7 @@ class Visualizer:
 
     def fig1_scale_online_time(self, scale: Dict) -> None:
         self._plot_scale_metric(
-            scale,
+            self._filter_scale_methods(scale),
             "online_scheduling_time_s",
             "在线调度时间(s)",
             "图1  卫星数量与在线调度时间",
@@ -4037,7 +4065,13 @@ class Visualizer:
         self._save("Fig4_Scale_Delivery_Ratio.png")
 
     def fig4_scale_delivery_ratio(self, scale: Dict) -> None:
+        scale = self._filter_scale_methods(scale)
+        nodes = np.asarray(scale.get("nodes", []), dtype=float)
         methods = scale.get("methods", []) if scale else []
+        if len(nodes) == 0 or not methods:
+            self._empty_figure("Fig4_Scale_Delivery_Ratio.png", "图4  Top-K稀疏候选图的交付性能权衡", "没有规模实验数据。")
+            return
+
         delivery_values: List[float] = []
         for method in methods:
             for key in ("delivery_ratio", "delivery_ratio_q25", "delivery_ratio_q75"):
@@ -4051,14 +4085,78 @@ class Visualizer:
                 lo = max(0.0, mid - 0.05)
                 hi = min(1.02, mid + 0.05)
             ylim = (lo, hi)
+
+        fig, ax = self.plt.subplots(figsize=(11.0, 6.2))
+        markers = ["o", "s", "D", "^"]
+        for i, method in enumerate(methods):
+            vals = np.asarray(method.get("delivery_ratio", []), dtype=float)
+            if len(vals) != len(nodes):
+                continue
+            linestyle = "-" if method.get("candidate_graph") == "Top-K Graph" else (0, (4, 2))
+            ax.plot(
+                nodes,
+                vals,
+                marker=markers[i % len(markers)],
+                linestyle=linestyle,
+                lw=1.8,
+                ms=6.4,
+                color=method.get("color", "#777777"),
+                label=self._zh_label(method.get("label", f"M{i + 1}")),
+                alpha=0.95,
+            )
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.set_xlabel("卫星数量", fontsize=11)
+        ax.set_ylabel("交付率", fontsize=11)
+        ax.set_title("图4  Top-K稀疏候选图的交付性能权衡", fontsize=13, fontweight="bold")
+        ax.grid(True, which="major", ls="--", alpha=0.24)
+        ax.grid(True, which="minor", ls=":", alpha=0.12)
+        ax.legend(ncol=2, fontsize=8.4, framealpha=0.96, facecolor="white", edgecolor="#BDBDBD", loc="best")
+
+        inset_mask = (nodes >= 1000.0) & (nodes <= 7500.0)
+        if np.any(inset_mask):
+            inset = ax.inset_axes([0.08, 0.12, 0.39, 0.36])
+            inset_values: List[float] = []
+            inset_nodes = nodes[inset_mask]
+            for i, method in enumerate(methods):
+                vals = np.asarray(method.get("delivery_ratio", []), dtype=float)
+                if len(vals) != len(nodes):
+                    continue
+                inset_vals = vals[inset_mask]
+                inset_values.extend(float(v) for v in inset_vals if np.isfinite(float(v)))
+                linestyle = "-" if method.get("candidate_graph") == "Top-K Graph" else (0, (4, 2))
+                inset.plot(
+                    inset_nodes,
+                    inset_vals,
+                    marker=markers[i % len(markers)],
+                    linestyle=linestyle,
+                    lw=1.15,
+                    ms=3.4,
+                    color=method.get("color", "#777777"),
+                    alpha=0.95,
+                )
+            inset.set_xlim(1000.0, 7500.0)
+            if inset_values:
+                in_lo = max(0.0, float(np.min(inset_values)) - 0.015)
+                in_hi = min(1.02, float(np.max(inset_values)) + 0.015)
+                if in_hi - in_lo < 0.05:
+                    mid = 0.5 * (in_lo + in_hi)
+                    in_lo = max(0.0, mid - 0.025)
+                    in_hi = min(1.02, mid + 0.025)
+                inset.set_ylim(in_lo, in_hi)
+            inset.set_title("1000-7500局部放大", fontsize=8.0)
+            inset.tick_params(axis="both", labelsize=7.0)
+            inset.grid(True, ls="--", alpha=0.22)
+
+        self._save("Fig4_Scale_Delivery_Ratio.png")
+
+    def fig14_average_delivery_latency(self, scale: Dict) -> None:
         self._plot_scale_metric(
-            scale,
-            "delivery_ratio",
-            "交付率",
-            "图4  Top-K稀疏候选图的交付性能权衡",
-            "Fig4_Scale_Delivery_Ratio.png",
-            note="交付率用于量化Top-K稀疏候选图在在线计算效率与传输性能之间的权衡。",
-            ylim=ylim,
+            self._filter_scale_methods(scale),
+            "avg_delivery_latency_s",
+            "平均端到端交付时延(s)",
+            "图14  筛选后卫星星座的传播平均时延",
+            "Fig14_Average_Delivery_Latency.png",
         )
 
     def fig5_nsga_pareto_front(self, X: np.ndarray, F: np.ndarray, dl: DataLoader) -> None:
@@ -4151,6 +4249,10 @@ class Visualizer:
             self._empty_figure("Fig8_TopK_Efficiency_Performance.png", "图8  Top-K效率-性能权衡", "没有Top-K数据。")
             return
         df = pd.DataFrame(rows)
+        df = df[df["method"].astype(str) != "Proposed"].copy()
+        if df.empty:
+            self._empty_figure("Fig10_Cross_Layer_Ablation.png", "图10  跨层评分消融实验", "没有非 Proposed 消融数据。")
+            return
         labels = ["全图" if str(x) == "Full Graph" else str(x) for x in df["k"].tolist()]
         x = np.arange(len(labels))
         fig, ax1 = self.plt.subplots(figsize=(10.2, 5.8))
@@ -4329,33 +4431,22 @@ class Visualizer:
                 return np.zeros(len(df), dtype=np.float64)
             return pd.to_numeric(df[name], errors="coerce").fillna(0.0).to_numpy(dtype=float)
 
-        ttl_drop_increase = numeric_column("ttl_drop_increase_mb_vs_proposed")
-        low_power_change = numeric_column("low_power_change_vs_proposed")
-        if np.nanmax(np.abs(ttl_drop_increase[1:])) > 1e-9 if len(ttl_drop_increase) > 1 else False:
-            mechanism_spec = (
-                "ttl_drop_increase_mb",
-                "TTL过期丢弃增加(MB)",
-                ttl_drop_increase,
-                lambda v: f"{v:+.0f}",
-            )
-        else:
-            mechanism_spec = (
-                "low_power_change",
-                "低电量保护事件变化",
-                low_power_change,
-                lambda v: f"{v:+.0f}",
-            )
-        plot_specs = [
+        metric_specs = [
             (
                 "weighted_utility_drop_pct",
                 "加权效用下降(%)",
                 -numeric_column(utility_change_key),
                 lambda v: f"{v:+.1f}%",
             ),
-            mechanism_spec,
+            (
+                "ttl_drop_increase_mb",
+                "过期丢弃增加(MB)",
+                numeric_column("ttl_drop_increase_mb_vs_proposed"),
+                lambda v: f"{v:+.0f} MB",
+            ),
             (
                 "unit_energy_change_pct",
-                "单位交付能耗变化(%)",
+                "单位能耗变化(%)",
                 numeric_column("unit_energy_change_pct_vs_proposed"),
                 lambda v: f"{v:+.1f}%",
             ),
@@ -4366,60 +4457,57 @@ class Visualizer:
                 lambda v: f"{v:+.1f}%",
             ),
         ]
-        fig, axes = self.plt.subplots(2, 2, figsize=(13.2, 8.0))
-        axes = axes.ravel()
-        x = np.arange(len(df))
+        raw_matrix = np.column_stack([np.asarray(vals, dtype=float) for _key, _label, vals, _fmt in metric_specs])
+        metric_scale = np.maximum(np.nanmax(np.abs(raw_matrix), axis=0), 1e-9)
+        plot_matrix = raw_matrix / metric_scale
+        fig, ax = self.plt.subplots(figsize=(13.8, 6.6))
+        x = np.arange(len(df), dtype=float)
+        width = 0.18
+        offsets = (np.arange(len(metric_specs), dtype=float) - (len(metric_specs) - 1) / 2.0) * width
+        colors = ["#4C78A8", "#F58518", "#54A24B", "#B279A2"]
         labels = [self._zh_label(label) for label in df["method"].tolist()]
-        method_names = df["method"].astype(str).tolist()
-        for ax, (_key, title, vals, fmt) in zip(axes, plot_specs):
-            vals = np.asarray(vals, dtype=float)
-            colors = []
-            for method_name, val in zip(method_names, vals):
-                if method_name == "Proposed":
-                    colors.append("#8A8A8A")
-                elif method_name in {"Distance Only", "No Cross-layer Score"}:
-                    colors.append("#D95F02")
-                elif val >= 0.0:
-                    colors.append("#5DA5DA")
-                else:
-                    colors.append("#1B9E77")
-            bars = ax.bar(x, vals, color=colors, edgecolor="#333333", linewidth=0.6)
-            ax.axhline(0.0, color="#555555", lw=0.8, ls="--")
-            ax.set_title(title, fontsize=11.0, fontweight="bold")
-            ax.set_xticks(x)
-            ax.set_xticklabels(labels, rotation=22, ha="right", fontsize=8.2)
-            ax.set_ylabel("相对 Proposed 的变化")
-            ax.grid(True, axis="y", ls="--", alpha=0.22)
-            finite_vals = vals[np.isfinite(vals)]
-            if len(finite_vals) == 0:
-                finite_vals = np.array([0.0])
-            y_min = min(0.0, float(np.min(finite_vals)))
-            y_max = max(0.0, float(np.max(finite_vals)))
-            span = max(y_max - y_min, 0.5)
-            ax.set_ylim(y_min - 0.14 * span, y_max + 0.24 * span)
-            for bar, plotted in zip(bars, vals):
+        for metric_i, (_key, title, _vals, fmt) in enumerate(metric_specs):
+            bars = ax.bar(
+                x + offsets[metric_i],
+                plot_matrix[:, metric_i],
+                width=width,
+                color=colors[metric_i],
+                edgecolor="#333333",
+                linewidth=0.55,
+                label=title,
+                alpha=0.96,
+            )
+            for bar, raw_val, plotted in zip(bars, raw_matrix[:, metric_i], plot_matrix[:, metric_i]):
                 if plotted >= 0.0:
-                    y = plotted + 0.035 * span
+                    y = plotted + 0.035
                     va = "bottom"
                 else:
-                    y = plotted - 0.035 * span
+                    y = plotted - 0.035
                     va = "top"
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
                     y,
-                    fmt(float(plotted)),
+                    fmt(float(raw_val)),
                     ha="center",
                     va=va,
-                    fontsize=7.4,
+                    fontsize=7.1,
                     rotation=90,
                     color="#222222",
                 )
-        fig.suptitle(
-            "图10  消融压力场景下跨层评分组件的相对退化\n"
-            "正值通常表示相对 Proposed 变差；绿色负值表示该指标出现局部改善。",
-            fontsize=13.0,
-            fontweight="bold",
-        )
+        finite_plot = plot_matrix[np.isfinite(plot_matrix)]
+        if finite_plot.size == 0:
+            finite_plot = np.array([0.0])
+        y_min = min(0.0, float(np.min(finite_plot)))
+        y_max = max(0.0, float(np.max(finite_plot)))
+        span = max(y_max - y_min, 1.0)
+        ax.set_ylim(y_min - 0.18 * span, y_max + 0.34 * span)
+        ax.axhline(0.0, color="#555555", lw=0.85, ls="--")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=18, ha="right", fontsize=8.6)
+        ax.set_ylabel("按每类指标最大绝对值归一化后的变化", fontsize=10.5)
+        ax.set_title("图10  跨层评分组件消融的分组对比", fontsize=13.0, fontweight="bold")
+        ax.grid(True, axis="y", ls="--", alpha=0.22)
+        ax.legend(ncol=4, fontsize=8.5, framealpha=0.96, facecolor="white", edgecolor="#BDBDBD", loc="upper center")
         self._save("Fig10_Cross_Layer_Ablation.png")
 
     def fig11_greedy_hungarian_quality_gap(self, matcher: Dict) -> None:
@@ -4736,6 +4824,7 @@ def main() -> None:
         # vis.fig2_scale_total_runtime(scale)
         # vis.fig3_scale_activation_ratio(scale)
         vis.fig4_scale_delivery_ratio(scale)
+        vis.fig14_average_delivery_latency(scale)
         # Temporarily disabled: Fig5-Fig7 NSGA diagnostic plots.
         # vis.fig5_nsga_pareto_front(result["X"], result["F"], dl)
         # vis.fig6_nsga_convergence(result["history"])
