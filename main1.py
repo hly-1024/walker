@@ -82,6 +82,17 @@ ABLATION_CONFIGS = (
     ("No Task Priority", {"future_gs": True, "energy": True, "task_priority": False, "buffer_pressure": True}),
     ("No Buffer Pressure", {"future_gs": True, "energy": True, "task_priority": True, "buffer_pressure": False}),
 )
+FIG10_MAIN_METHODS = ("Proposed", "No Future GS", "Distance Only", "No Cross-layer Score")
+ABLATION_STATE_TABLE_METHODS = ("Proposed", "No Energy", "No Task Priority", "No Buffer Pressure", "No Future GS")
+ABLATION_METHOD_ZH = {
+    "Proposed": "本文方法",
+    "No Future GS": "去除未来地面站可见性",
+    "No Energy": "去除能量评分",
+    "No Task Priority": "去除任务优先级",
+    "No Buffer Pressure": "去除缓存压力",
+    "Distance Only": "仅距离评分",
+    "No Cross-layer Score": "无跨层评分",
+}
 
 
 def ground_station_ecef(lat_deg: float, lon_deg: float) -> np.ndarray:
@@ -226,6 +237,14 @@ class Config:
     ISL_MAX_DIST: float = 4000.0
     ISL_NEIGHBOR_K: int = 12
     TOPK_CANDIDATES: int = 12
+    TOPK_PREFILTER_POOL: int = 48
+    TOPK_PREFILTER_MODE: str = "cross_layer"
+    TOPK_W_DISTANCE: float = 0.20
+    TOPK_W_FUTURE_GS: float = 0.25
+    TOPK_W_DOWNLINK_WAIT: float = 0.25
+    TOPK_W_BUFFER: float = 0.15
+    TOPK_W_ENERGY: float = 0.10
+    TOPK_W_TASK: float = 0.05
     ADAPTIVE_K_BASE: int = 8
     ADAPTIVE_K_MIN: int = 4
     ADAPTIVE_K_MAX: int = 12
@@ -289,7 +308,7 @@ def apply_profile(cfg: Config, profile: str) -> Config:
         cfg.SCALABILITY_EVAL_REPEATS = 1
     elif profile != "full":
         raise ValueError(f"unknown profile: {profile}")
-    cfg.ISL_NEIGHBOR_K = int(cfg.ADAPTIVE_K_MAX)
+    cfg.ISL_NEIGHBOR_K = int(max(cfg.ADAPTIVE_K_MAX, cfg.TOPK_PREFILTER_POOL))
     cfg.TOPK_CANDIDATES = int(cfg.ADAPTIVE_K_MAX)
     return cfg
 
@@ -684,7 +703,8 @@ class DataLoader:
         sat_hash = hashlib.sha1("\n".join(map(str, self.sat_names)).encode("utf-8")).hexdigest()[:10]
         stem = (
             f"isl_topk_N{self.N}_T{self.T}_K{self.cfg.ISL_NEIGHBOR_K}_"
-            f"D{int(self.cfg.ISL_MAX_DIST)}_t{int(self.times_s[0])}-{int(self.times_s[-1])}_"
+            f"D{int(self.cfg.ISL_MAX_DIST)}_Pool{int(self.cfg.TOPK_PREFILTER_POOL)}_"
+            f"t{int(self.times_s[0])}-{int(self.times_s[-1])}_"
             f"s{sat_hash}.npz"
         )
         return cache_dir / stem
@@ -841,6 +861,69 @@ class SimulationEngine:
         t_end = min(int(t) + max(1, int(self.cfg.WINDOW_LOOKAHEAD)), self.dl.T)
         future = self.dl.vis_gs[int(t):t_end, sats_arr]
         return np.clip(future.sum(axis=0).astype(np.float64) / max(float(t_end - int(t)), 1.0), 0.0, 1.0)
+
+    def _future_gs_wait_score(self, t: int, sats: np.ndarray) -> np.ndarray:
+        sats_arr = np.asarray(sats, dtype=np.int64)
+        if sats_arr.size == 0:
+            return np.zeros(0, dtype=np.float64)
+        t0 = int(t)
+        lookahead = max(1, int(self.cfg.WINDOW_LOOKAHEAD))
+        t_end = min(t0 + lookahead, self.dl.T)
+        if t0 >= t_end:
+            return np.zeros(sats_arr.size, dtype=np.float64)
+        future = self.dl.vis_gs[t0:t_end, sats_arr]
+        visible = np.any(future, axis=0)
+        first = np.argmax(future, axis=0).astype(np.float64)
+        score = np.zeros(sats_arr.size, dtype=np.float64)
+        score[visible] = 1.0 - first[visible] / max(float(lookahead), 1.0)
+        return np.clip(score, 0.0, 1.0)
+
+    def _topk_prefilter_scores(
+        self,
+        t: int,
+        sender: int,
+        cand: np.ndarray,
+        dist: np.ndarray,
+        q_region: np.ndarray,
+        q_total: np.ndarray,
+        e: np.ndarray,
+        score_flags: Optional[Dict[str, bool]] = None,
+    ) -> np.ndarray:
+        """Score candidate-edge prefiltering before matching.
+
+        Cross-layer Top-K implements candidate-edge prefiltering before matching.
+        It moves gateway visibility, downlink waiting time, buffer state, energy
+        state, and task value from post-Top-K scoring into the candidate
+        construction stage.
+        """
+        cfg = self.cfg
+        cand_arr = np.asarray(cand, dtype=np.int64)
+        dist_arr = np.asarray(dist, dtype=np.float64)
+        if cand_arr.size == 0:
+            return np.zeros(0, dtype=np.float64)
+        distance_score = 1.0 - np.clip(dist_arr / max(float(cfg.ISL_MAX_DIST), 1e-9), 0.0, 1.0)
+        future_gs_score = self._future_gs_score(t, cand_arr)
+        downlink_wait_score = self._future_gs_wait_score(t, cand_arr)
+        receiver_free_capacity = np.clip(
+            (float(cfg.Q_MAX_COMM) - q_total[cand_arr]) / max(float(cfg.Q_MAX_COMM), 1e-9),
+            0.0,
+            1.0,
+        )
+        energy_score = np.clip(np.minimum(float(e[int(sender)]), e[cand_arr]) / max(float(cfg.E_MAX), 1e-9), 0.0, 1.0)
+        priority_value = float(self._task_priority(q_region, np.asarray([int(sender)]), self.dl.task_region_weights)[0])
+        task_priority = np.full(cand_arr.size, priority_value, dtype=np.float64)
+        future_enabled = self._score_flag(score_flags, "future_gs")
+        return self._weighted_sum(
+            [
+                (True, float(cfg.TOPK_W_DISTANCE), distance_score),
+                (future_enabled, float(cfg.TOPK_W_FUTURE_GS), future_gs_score),
+                (future_enabled, float(cfg.TOPK_W_DOWNLINK_WAIT), downlink_wait_score),
+                (self._score_flag(score_flags, "buffer_pressure"), float(cfg.TOPK_W_BUFFER), receiver_free_capacity),
+                (self._score_flag(score_flags, "energy"), float(cfg.TOPK_W_ENERGY), energy_score),
+                (self._score_flag(score_flags, "task_priority"), float(cfg.TOPK_W_TASK), task_priority),
+            ],
+            distance_score,
+        )
 
     def _adaptive_k_value(self, buffer_pressure: float, gs_direction_score: float, task_priority: float) -> int:
         cfg = self.cfg
@@ -1145,8 +1228,8 @@ class SimulationEngine:
 
         pos_t = dl.pos_icrf[t].astype(np.float64, copy=False)
         if use_topk:
-            idx_k = dl.isl_neighbor_idx[t, senders]
-            dist_k = dl.isl_neighbor_dist[t, senders]
+            idx_pool = dl.isl_neighbor_idx[t, senders]
+            dist_pool = dl.isl_neighbor_dist[t, senders]
             full_receiver_idx = None
             full_neighbor_lists = None
         else:
@@ -1158,8 +1241,8 @@ class SimulationEngine:
                 full_neighbor_lists = full_tree.query_ball_point(pos_t[senders], r=cfg.ISL_MAX_DIST, workers=-1)
             except TypeError:
                 full_neighbor_lists = full_tree.query_ball_point(pos_t[senders], r=cfg.ISL_MAX_DIST)
-            idx_k = None
-            dist_k = None
+            idx_pool = None
+            dist_pool = None
 
         rows: List[int] = []
         cols: List[int] = []
@@ -1167,8 +1250,8 @@ class SimulationEngine:
 
         for row, s in enumerate(senders):
             if use_topk:
-                cand = idx_k[row]
-                dist = dist_k[row]
+                cand = idx_pool[row]
+                dist = dist_pool[row]
             else:
                 local = full_neighbor_lists[row]
                 if len(local) == 0:
@@ -1185,6 +1268,11 @@ class SimulationEngine:
                 continue
             cand = cand[active]
             dist = dist[active]
+            los = self._los_mask(np.repeat(pos_t[s][None, :], len(cand), axis=0), pos_t[cand])
+            if not np.any(los):
+                continue
+            cand = cand[los]
+            dist = dist[los]
             if use_topk:
                 if fixed_topk_k is None:
                     sender_pressure = q_total[s] / max(cfg.Q_MAX_COMM, 1e-9)
@@ -1194,16 +1282,28 @@ class SimulationEngine:
                     sender_priority = float(self._task_priority(q_region, np.asarray([s]), dl.task_region_weights)[0])
                     k_s = self._adaptive_k_value(sender_pressure, sender_gs, sender_priority)
                 else:
-                    k_s = int(np.clip(int(fixed_topk_k), 1, dl.isl_neighbor_idx.shape[2]))
+                    k_s = max(1, int(fixed_topk_k))
                 if len(cand) > k_s:
-                    cand = cand[:k_s]
-                    dist = dist[:k_s]
-
-            los = self._los_mask(np.repeat(pos_t[s][None, :], len(cand), axis=0), pos_t[cand])
-            if not np.any(los):
-                continue
-            cand = cand[los]
-            dist = dist[los]
+                    mode = str(getattr(cfg, "TOPK_PREFILTER_MODE", "distance")).strip().lower()
+                    if mode == "distance":
+                        order = np.arange(len(cand), dtype=np.int64)
+                    elif mode == "cross_layer":
+                        pre_scores = self._topk_prefilter_scores(
+                            t,
+                            int(s),
+                            cand,
+                            dist,
+                            q_region,
+                            q_total,
+                            e,
+                            score_flags=score_flags,
+                        )
+                        order = np.argsort(-pre_scores, kind="mergesort")
+                    else:
+                        raise ValueError(f"unknown TOPK_PREFILTER_MODE={cfg.TOPK_PREFILTER_MODE!r}")
+                    take = order[:k_s]
+                    cand = cand[take]
+                    dist = dist[take]
             if use_energy_score:
                 score = self._edge_scores(t, int(s), cand, dist, q_region, q_total, e, score_flags=score_flags)
             else:
@@ -1349,6 +1449,9 @@ class SimulationEngine:
                 "low_power_protection_count": 0,
                 "melt_count": 0,
                 "final_buffer_mb": 0.0,
+                "topk_prefilter_mode": str(cfg.TOPK_PREFILTER_MODE),
+                "topk_prefilter_pool": int(cfg.TOPK_PREFILTER_POOL),
+                "topk_final_max_k": int(cfg.ADAPTIVE_K_MAX),
                 "utility": 0.0,
                 "delivery_utility": 0.0,
                 "constraint_valid": bool(np.all(~sense_on | comm_on)),
@@ -1637,6 +1740,9 @@ class SimulationEngine:
             "low_power_protection_count": int(low_power_events),
             "melt_count": int(melt_events),
             "final_buffer_mb": float(total_buffer),
+            "topk_prefilter_mode": str(cfg.TOPK_PREFILTER_MODE),
+            "topk_prefilter_pool": int(cfg.TOPK_PREFILTER_POOL),
+            "topk_final_max_k": int(cfg.ADAPTIVE_K_MAX),
             "utility": utility,
             "delivery_utility": delivery_utility,
             "constraint_valid": bool(np.all(~sense_on | comm_on) and int(max_observed_relay_hops) <= int(cfg.MAX_RELAY_HOPS)),
@@ -2804,6 +2910,7 @@ def _summary_for_experiment(method: str, ratio: Optional[float], summary: Dict, 
         "dropped_mb": float(summary.get("dropped_mb", 0.0)),
         "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
         "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
+        "avg_delivery_latency_s": float(summary.get("avg_delivery_latency_s", 0.0)),
         "avg_queue_backlog_mb": float(summary.get("avg_queue_backlog_mb", 0.0)),
         "final_buffer_mb": float(summary.get("final_buffer_mb", 0.0)),
         "online_scheduling_time_s": float(summary.get("online_scheduling_time_s", 0.0)),
@@ -2828,6 +2935,12 @@ def _summary_for_experiment(method: str, ratio: Optional[float], summary: Dict, 
         "max_observed_relay_hops": int(summary.get("max_observed_relay_hops", 0)),
         "dropped_ttl_mb": float(summary.get("dropped_ttl_mb", 0.0)),
         "dropped_melt_mb": float(summary.get("dropped_melt_mb", 0.0)),
+        "delivered_by_region_mb": summary.get("delivered_by_region_mb", []),
+        "generated_by_region_mb": summary.get("generated_by_region_mb", []),
+        "dropped_by_region_mb": summary.get("dropped_by_region_mb", []),
+        "topk_prefilter_mode": str(summary.get("topk_prefilter_mode", "")),
+        "topk_prefilter_pool": int(summary.get("topk_prefilter_pool", 0)),
+        "topk_final_max_k": int(summary.get("topk_final_max_k", 0)),
     }
     if extra:
         row.update(extra)
@@ -2955,6 +3068,42 @@ def run_topk_sensitivity_experiment(cfg: Config, dl: DataLoader, best_gene: np.n
         row["normalized_utility_vs_full"] = float(row.get("utility", 0.0)) / full_utility
         row["speedup_vs_full"] = full_online / max(float(row.get("online_scheduling_time_s", 0.0)), 1e-9)
     return {"rows": rows, "scenario": "Stress"}
+
+
+def run_topk_prefilter_ablation_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) -> Dict:
+    print("=" * 72)
+    print("S6b Top-K prefilter mode ablation experiment")
+    print("=" * 72)
+    rows: List[Dict] = []
+    cases = (("Distance Top-K", "distance"), ("Cross-layer Top-K", "cross_layer"))
+    for method, mode in cases:
+        local_cfg = replace(cfg)
+        local_cfg.TOPK_PREFILTER_MODE = mode
+        engine = SimulationEngine(local_cfg, dl)
+        for k in TOPK_SENSITIVITY_VALUES:
+            _, counts, hist = engine.evaluate(
+                best_gene,
+                return_summary=True,
+                matcher_mode="hungarian",
+                use_topk=True,
+                fixed_topk_k=int(k),
+            )
+            summary = dict(hist.get("summary", {})) if hist else {}
+            rows.append(
+                _summary_for_experiment(
+                    method,
+                    None,
+                    summary,
+                    counts,
+                    {
+                        "k": int(k),
+                        "topk_prefilter_mode": mode,
+                        "scenario": "Stress",
+                    },
+                )
+            )
+        print(f"  topk prefilter {method} completed")
+    return {"rows": rows}
 
 
 def run_sparse_activation_curve_experiment(cfg: Config, dl: DataLoader, best_gene: np.ndarray) -> Dict:
@@ -3574,20 +3723,116 @@ def run_time_budget_optimizer_experiment(
     }
 
 
+def _safe_metric_name(name: str) -> str:
+    safe = str(name).strip().replace(" ", "_")
+    safe = "".join(ch for ch in safe if ch.isalnum() or ch == "_")
+    return safe or "metric"
+
+
+def _metric_float(row: Dict, name: str, default: float = 0.0) -> float:
+    value = row.get(name, default)
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _metric_list(value) -> List[float]:
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        return []
+    out = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            out.append(np.nan)
+    return out
+
+
+def build_ablation_state_metric_rows(ablation: Dict) -> List[Dict]:
+    """Build state-level ablation metrics for the terms omitted from Fig10.
+
+    Energy, task-priority, and buffer-pressure terms may mainly affect
+    state-level metrics such as queue backlog, energy safety, relay
+    participation, and TTL drops rather than only aggregate delivery ratio.
+    """
+    rows = ablation.get("rows", []) if ablation else []
+    out_rows: List[Dict] = []
+    for row in rows:
+        method = str(row.get("method", ""))
+        out = {
+            "method": method,
+            "method_zh": ABLATION_METHOD_ZH.get(method, method),
+            "delivery_ratio": _metric_float(row, "delivery_ratio"),
+            "delivery_utility": _metric_float(row, "delivery_utility"),
+            "utility": _metric_float(row, "utility"),
+            "avg_delivery_latency_s": _metric_float(row, "avg_delivery_latency_s"),
+            "avg_queue_backlog_mb": _metric_float(row, "avg_queue_backlog_mb"),
+            "final_buffer_mb": _metric_float(row, "final_buffer_mb"),
+            "dropped_ttl_mb": _metric_float(row, "dropped_ttl_mb"),
+            "dropped_melt_mb": _metric_float(row, "dropped_melt_mb"),
+            "packet_loss_rate": _metric_float(row, "packet_loss_rate"),
+            "unit_delivered_energy": _metric_float(row, "unit_delivered_energy", np.nan),
+            "min_remaining_energy": _metric_float(row, "min_remaining_energy"),
+            "avg_remaining_energy": _metric_float(row, "avg_remaining_energy"),
+            "low_power_protection_count": int(_metric_float(row, "low_power_protection_count")),
+            "melt_count": int(_metric_float(row, "melt_count")),
+            "avg_delivered_relay_hops": _metric_float(row, "avg_delivered_relay_hops"),
+            "max_observed_relay_hops": int(_metric_float(row, "max_observed_relay_hops")),
+            "actual_forward_participation_ratio": _metric_float(row, "actual_forward_participation_ratio"),
+            "actual_forward_unique_satellite_count": int(_metric_float(row, "actual_forward_unique_satellite_count")),
+            "actual_downlink_unique_satellite_count": int(_metric_float(row, "actual_downlink_unique_satellite_count")),
+            "topk_prefilter_mode": str(row.get("topk_prefilter_mode", "")),
+            "topk_prefilter_pool": int(_metric_float(row, "topk_prefilter_pool")),
+        }
+        region_specs = (
+            ("delivered_by_region_mb", "delivered"),
+            ("generated_by_region_mb", "generated"),
+            ("dropped_by_region_mb", "dropped"),
+        )
+        for source_key, prefix in region_specs:
+            values = _metric_list(row.get(source_key, []))
+            for i, value in enumerate(values):
+                out[f"{prefix}_region_{i}_mb"] = value
+                if i < len(TASK_REGION_NAMES):
+                    out[f"{prefix}_{_safe_metric_name(TASK_REGION_NAMES[i])}_mb"] = value
+        out_rows.append(out)
+    return out_rows
+
+
 def save_academic_experiment_outputs(
     out_dir: Path,
     topk: Dict,
     sparse: Dict,
     ablation: Dict,
     matcher: Optional[Dict] = None,
+    topk_prefilter_ablation: Optional[Dict] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(topk.get("rows", [])).to_csv(out_dir / "table3_topk_sensitivity.csv", index=False, encoding="utf-8-sig")
     sparse_table_rows = list(sparse.get("raw_rows", [])) + list(sparse.get("rows", []))
     pd.DataFrame(sparse_table_rows).to_csv(out_dir / "table4_sparse_activation_curve.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(ablation.get("rows", [])).to_csv(out_dir / "table5_ablation.csv", index=False, encoding="utf-8-sig")
+    ablation_rows = list(ablation.get("rows", []))
+    pd.DataFrame(ablation_rows).to_csv(out_dir / "table5_ablation.csv", index=False, encoding="utf-8-sig")
+    fig10_rows = [row for row in ablation_rows if str(row.get("method", "")) in set(FIG10_MAIN_METHODS)]
+    pd.DataFrame(fig10_rows).to_csv(out_dir / "table5_ablation_main_figure_rows.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(build_ablation_state_metric_rows(ablation)).to_csv(
+        out_dir / "table5_ablation_state_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
     if matcher is not None:
         pd.DataFrame(matcher.get("rows", [])).to_csv(out_dir / "table7_matcher_quality.csv", index=False, encoding="utf-8-sig")
+    if topk_prefilter_ablation is not None:
+        pd.DataFrame(topk_prefilter_ablation.get("rows", [])).to_csv(
+            out_dir / "table9_topk_prefilter_ablation.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     print(f"  saved academic comparison tables in {out_dir}")
 
 
@@ -3678,6 +3923,8 @@ class Visualizer:
             "No Buffer Pressure": "去除缓存压力",
             "Distance Only": "仅距离评分",
             "No Cross-layer Score": "无跨层评分",
+            "Distance Top-K": "距离Top-K",
+            "Cross-layer Top-K": "跨层感知Top-K",
             "Full Activation": "全激活",
             "No Energy Score": "无能量评分",
         }
@@ -4155,7 +4402,7 @@ class Visualizer:
             self._filter_scale_methods(scale),
             "avg_delivery_latency_s",
             "平均端到端交付时延(s)",
-            "图14  筛选后卫星星座的传播平均时延",
+            "图14  筛选后卫星星座的平均端到端交付时延",
             "Fig14_Average_Delivery_Latency.png",
         )
 
@@ -4420,9 +4667,18 @@ class Visualizer:
     def fig10_cross_layer_ablation(self, ablation: Dict) -> None:
         rows = ablation.get("rows", []) if ablation else []
         if not rows:
-            self._empty_figure("Fig10_Cross_Layer_Ablation.png", "图10  跨层评分消融实验", "没有消融实验数据。")
+            self._empty_figure("Fig10_Cross_Layer_Ablation.png", "图10  主导评分组件消融对比", "没有消融实验数据。")
+            return
+        # Fig10 keeps only dominant ablation factors to highlight primary performance degradation.
+        main_set = set(FIG10_MAIN_METHODS)
+        rows = [row for row in rows if str(row.get("method", "")) in main_set]
+        if not rows:
+            self._empty_figure("Fig10_Cross_Layer_Ablation.png", "图10  主导评分组件消融对比", "没有主导消融项数据。")
             return
         df = pd.DataFrame(rows)
+        order = {method: i for i, method in enumerate(FIG10_MAIN_METHODS)}
+        df["_plot_order"] = df["method"].map(lambda m: order.get(str(m), len(order))).astype(int)
+        df = df.sort_values("_plot_order").drop(columns=["_plot_order"]).reset_index(drop=True)
         utility_change_key = "delivery_utility_change_pct_vs_proposed"
         if utility_change_key not in df.columns:
             utility_change_key = "utility_change_pct_vs_proposed"
@@ -4505,10 +4761,107 @@ class Visualizer:
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=18, ha="right", fontsize=8.6)
         ax.set_ylabel("按每类指标最大绝对值归一化后的变化", fontsize=10.5)
-        ax.set_title("图10  跨层评分组件消融的分组对比", fontsize=13.0, fontweight="bold")
+        ax.set_title("图10  主导评分组件消融对比", fontsize=13.0, fontweight="bold")
         ax.grid(True, axis="y", ls="--", alpha=0.22)
         ax.legend(ncol=4, fontsize=8.5, framealpha=0.96, facecolor="white", edgecolor="#BDBDBD", loc="upper center")
         self._save("Fig10_Cross_Layer_Ablation.png")
+
+    def fig10b_ablation_state_metrics_table(self, ablation: Dict) -> None:
+        try:
+            rows = build_ablation_state_metric_rows(ablation)
+            rows = [row for row in rows if str(row.get("method", "")) in set(ABLATION_STATE_TABLE_METHODS)]
+            if not rows:
+                self._empty_figure("Fig10b_Ablation_State_Metrics_Table.png", "图10b  弱敏感组件的细粒度状态指标对比", "没有细粒度状态指标数据。")
+                return
+            order = {method: i for i, method in enumerate(ABLATION_STATE_TABLE_METHODS)}
+            rows = sorted(rows, key=lambda row: order.get(str(row.get("method", "")), len(order)))
+            columns = [
+                ("method_zh", "方法", lambda v: str(v)),
+                ("avg_queue_backlog_mb", "平均缓存积压", lambda v: f"{float(v):.0f}"),
+                ("final_buffer_mb", "最终缓存", lambda v: f"{float(v):.0f}"),
+                ("dropped_ttl_mb", "TTL丢弃", lambda v: f"{float(v):.0f}"),
+                ("unit_delivered_energy", "单位交付能耗", lambda v: "NA" if v is None or not np.isfinite(float(v)) else f"{float(v):.4f}"),
+                ("min_remaining_energy", "最低剩余能量", lambda v: f"{float(v):.2f}"),
+                ("low_power_protection_count", "低电量保护次数", lambda v: f"{int(float(v))}"),
+                ("avg_delivered_relay_hops", "平均中继跳数", lambda v: f"{float(v):.2f}"),
+                ("actual_forward_participation_ratio", "实际转发节点比例", lambda v: f"{float(v) * 100.0:.1f}%"),
+                ("avg_delivery_latency_s", "平均端到端时延", lambda v: f"{float(v):.1f}"),
+            ]
+            cell_text = []
+            for row in rows:
+                cell_text.append([fmt(row.get(key, np.nan)) for key, _label, fmt in columns])
+            fig, ax = self.plt.subplots(figsize=(15.5, 4.8))
+            ax.axis("off")
+            table = ax.table(
+                cellText=cell_text,
+                colLabels=[label for _key, label, _fmt in columns],
+                loc="center",
+                cellLoc="center",
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(7.0)
+            table.scale(1.0, 1.55)
+            for (r, _c), cell in table.get_celld().items():
+                cell.set_edgecolor("#D0D0D0")
+                if r == 0:
+                    cell.set_facecolor("#F0F3F7")
+                    cell.set_text_props(weight="bold")
+            ax.set_title("图10b  弱敏感组件的细粒度状态指标对比", fontsize=13.0, fontweight="bold", pad=16)
+            self._save("Fig10b_Ablation_State_Metrics_Table.png")
+        except Exception as exc:
+            print(f"  skipped Fig10b_Ablation_State_Metrics_Table.png: {exc}")
+
+    def fig15_topk_prefilter_ablation(self, topk_prefilter: Dict) -> None:
+        rows = topk_prefilter.get("rows", []) if topk_prefilter else []
+        if not rows:
+            self._empty_figure("Fig15_CrossLayer_TopK_vs_Distance_TopK.png", "图15  跨层感知Top-K与距离Top-K的时效性能对比", "没有Top-K预筛选对比数据。")
+            return
+        df = pd.DataFrame(rows)
+        if "k" not in df.columns or "method" not in df.columns:
+            self._empty_figure("Fig15_CrossLayer_TopK_vs_Distance_TopK.png", "图15  跨层感知Top-K与距离Top-K的时效性能对比", "缺少K或方法字段。")
+            return
+        df["k_num"] = pd.to_numeric(df["k"], errors="coerce")
+        df = df[np.isfinite(df["k_num"])].copy()
+        if df.empty:
+            self._empty_figure("Fig15_CrossLayer_TopK_vs_Distance_TopK.png", "图15  跨层感知Top-K与距离Top-K的时效性能对比", "没有可绘制的K值。")
+            return
+        colors = {"Distance Top-K": "#7A7A7A", "Cross-layer Top-K": "#1F78B4"}
+        markers = {"Distance Top-K": "o", "Cross-layer Top-K": "s"}
+        fig, ax1 = self.plt.subplots(figsize=(10.8, 5.8))
+        ax2 = ax1.twinx()
+        line_handles = []
+        for method, sub in df.groupby("method", sort=False):
+            sub = sub.sort_values("k_num")
+            color = colors.get(str(method), None)
+            marker = markers.get(str(method), "o")
+            label = self._zh_label(str(method))
+            line1, = ax1.plot(
+                sub["k_num"],
+                pd.to_numeric(sub.get("avg_delivery_latency_s", 0.0), errors="coerce").fillna(0.0),
+                marker=marker,
+                lw=2.0,
+                color=color,
+                label=f"{label} 时延",
+            )
+            line2, = ax2.plot(
+                sub["k_num"],
+                pd.to_numeric(sub.get("delivery_ratio", 0.0), errors="coerce").fillna(0.0),
+                marker=marker,
+                lw=1.7,
+                ls="--",
+                color=color,
+                alpha=0.78,
+                label=f"{label} 交付率",
+            )
+            line_handles.extend([line1, line2])
+        ax1.set_xlabel("K值")
+        ax1.set_ylabel("平均端到端交付时延(s)")
+        ax2.set_ylabel("交付率")
+        ax2.set_ylim(0.0, min(1.05, max(1.0, float(pd.to_numeric(df.get("delivery_ratio", 0.0), errors="coerce").max()) * 1.08)))
+        ax1.set_title("图15  跨层感知Top-K与距离Top-K的时效性能对比", fontsize=13.0, fontweight="bold")
+        ax1.grid(True, ls="--", alpha=0.24)
+        ax1.legend(line_handles, [line.get_label() for line in line_handles], ncol=2, fontsize=8.5, framealpha=0.96, loc="best")
+        self._save("Fig15_CrossLayer_TopK_vs_Distance_TopK.png")
 
     def fig11_greedy_hungarian_quality_gap(self, matcher: Dict) -> None:
         rows = matcher.get("rows", []) if matcher else []
@@ -4843,6 +5196,7 @@ def main() -> None:
         stress_best_i = select_best_objective_index(stress_result["F"], utility_tol=max(float(stress_cfg.GA_CONV_EPS), 1e-6))
         stress_best_gene = stress_result["X"][stress_best_i].astype(bool)
         topk_exp = run_topk_sensitivity_experiment(stress_cfg, dl, stress_best_gene)
+        topk_prefilter_ablation = run_topk_prefilter_ablation_experiment(stress_cfg, dl, stress_best_gene)
         sparse_exp = run_sparse_activation_curve_experiment(stress_cfg, dl, stress_best_gene)
         ablation_cfg = make_ablation_stress_config(cfg)
         ablation_dl = _with_task_region_weights(dl, ABLATION_TASK_REGION_WEIGHTS, ablation_cfg)
@@ -4868,10 +5222,18 @@ def main() -> None:
         # matcher_exp = run_matcher_quality_experiment(scale)
         # Temporarily disabled: Fig12 energy-safety replay calculation.
         # energy_exp = run_energy_safety_timeseries_experiment(stress_cfg, dl, stress_best_gene)
-        save_academic_experiment_outputs(out_dir, topk_exp, sparse_exp, ablation_exp)
+        save_academic_experiment_outputs(
+            out_dir,
+            topk_exp,
+            sparse_exp,
+            ablation_exp,
+            topk_prefilter_ablation=topk_prefilter_ablation,
+        )
         vis.fig8_topk_efficiency_performance(topk_exp)
         vis.fig9_sparse_activation_utility_curve(sparse_exp)
         vis.fig10_cross_layer_ablation(ablation_exp)
+        vis.fig10b_ablation_state_metrics_table(ablation_exp)
+        vis.fig15_topk_prefilter_ablation(topk_prefilter_ablation)
         # Temporarily disabled: Fig11-Fig13 plotting and time-budget calculation/table8 output.
         # vis.fig11_greedy_hungarian_quality_gap(matcher_exp)
         # vis.fig12_energy_safety_timeseries(energy_exp)
