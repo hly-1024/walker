@@ -39,7 +39,7 @@ TASK_REGIONS = (
 )
 
 SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 2000)))
-SCALE_HUNGARIAN_METHOD_IDS = ("M7", "M8")
+SCALE_HUNGARIAN_METHOD_IDS = ("M3", "M4", "M7", "M8")
 SCALE_LOAD_FACTORS = (1.0,)
 TASK_LOAD_VALUES_MB = tuple(range(20000, 80001, 5000))
 TASK_LOAD_NODE_TARGETS = (2500, 5000, 10000, 20000)
@@ -3827,7 +3827,7 @@ class Visualizer:
         self._save("Fig4_Scale_Delivery_Ratio.png")
 
     def _fig4_scale_delivery_ratio_simple(self, scale: Dict) -> None:
-        scale = self._filter_scale_methods(self._filter_scale_load(scale, 1.0), TASK_LOAD_METHOD_IDS)
+        scale = self._filter_scale_methods(self._filter_scale_load(scale, 1.0), SCALE_HUNGARIAN_METHOD_IDS)
         nodes = np.asarray(scale.get("nodes", []), dtype=float)
         methods = scale.get("methods", []) if scale else []
         if len(nodes) == 0 or not methods:
