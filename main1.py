@@ -41,6 +41,7 @@ TASK_REGIONS = (
 SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 1000)))
 SCALE_TOPK_FULL_PAIRINGS = (("M1", "M2"), ("M3", "M4"), ("M5", "M6"), ("M7", "M8"))
 SCALE_HUNGARIAN_METHOD_IDS = ("M3", "M4", "M7", "M8")
+SCALE_LOAD_FACTORS = (1.0, 1.5, 2.0)
 TOPK_SENSITIVITY_VALUES = (1, 2, 3, 4, 6, 8, 10, 12)
 SPARSE_ACTIVATION_RATIOS = (
     0.01,
@@ -2615,6 +2616,7 @@ def run_scalability_experiment(
         np.random.default_rng(int(cfg.RNG_SEED) + 20260519 + 7919 * rep).permutation(n_total).astype(np.int32)
         for rep in range(repeat_count)
     ]
+    activation_cache: Dict[Tuple[int, int], Tuple[np.ndarray, float]] = {}
     series: Dict[str, Dict] = {}
     raw_rows: List[Dict] = []
     metric_keys = [
@@ -2637,6 +2639,7 @@ def run_scalability_experiment(
         "dropped_ttl_mb",
         "dropped_melt_mb",
         "delivery_ratio",
+        "delivery_ratio_offered",
         "packet_loss_rate",
         "utility",
     ]
@@ -2654,87 +2657,126 @@ def run_scalability_experiment(
                 merged[key] = float(np.mean(np.asarray(vals, dtype=np.float64)))
         return merged
 
-    for n in node_targets:
-        for rep, nested_order in enumerate(repeat_orders):
-            if int(n) == n_total:
-                sat_idx = np.arange(n_total, dtype=np.int32)
-            else:
-                sat_idx = np.sort(nested_order[: int(n)].astype(np.int32))
-            sub_dl = _subset_dataloader(dl, cfg, sat_idx)
-            print(
-                f"  scale point nodes={sub_dl.N}: repeat {rep + 1}/{repeat_count} "
-                "running NSGA-III activation optimization"
-            )
-            np.random.seed(int(cfg.RNG_SEED) + 20260519 + 100003 * rep + int(n))
-            scale_problem = ConstellationProblem(cfg, sub_dl)
-            scale_solver = NSGA3Solver(cfg)
-            scale_result = scale_solver.optimize(scale_problem.evaluate, sub_dl.N)
-            best_i = select_best_objective_index(scale_result["F"], utility_tol=max(float(cfg.GA_CONV_EPS), 1e-6))
-            scale_best_gene = scale_result["X"][best_i].astype(bool)
-            scale_nsga_runtime = float(scale_result.get("runtime_s", 0.0))
+    for load_i, load_factor in enumerate(SCALE_LOAD_FACTORS):
+        load_cfg = replace(cfg)
+        load_cfg.TASK_DATA_MB = float(cfg.TASK_DATA_MB) * float(load_factor)
+        load_cfg.TASK_GEN_RATE = float(cfg.TASK_GEN_RATE) * float(load_factor)
+        for n in node_targets:
+            for rep, nested_order in enumerate(repeat_orders):
+                if int(n) == n_total:
+                    sat_idx = np.arange(n_total, dtype=np.int32)
+                else:
+                    sat_idx = np.sort(nested_order[: int(n)].astype(np.int32))
+                sub_dl = _subset_dataloader(dl, load_cfg, sat_idx)
+                cache_key = (int(n), int(rep))
+                if cache_key in activation_cache:
+                    scale_best_gene, scale_nsga_runtime = activation_cache[cache_key]
+                    print(
+                        f"  scale point load={load_factor:.1f}x nodes={sub_dl.N}: "
+                        f"repeat {rep + 1}/{repeat_count} reusing baseline NSGA-III activation"
+                    )
+                else:
+                    print(
+                        f"  scale point load={load_factor:.1f}x nodes={sub_dl.N}: "
+                        f"repeat {rep + 1}/{repeat_count} running NSGA-III activation optimization"
+                    )
+                    np.random.seed(int(cfg.RNG_SEED) + 20260519 + 100003 * rep + int(n))
+                    activation_problem = ConstellationProblem(cfg, _subset_dataloader(dl, cfg, sat_idx))
+                    activation_solver = NSGA3Solver(cfg)
+                    activation_result = activation_solver.optimize(activation_problem.evaluate, sub_dl.N)
+                    best_i = select_best_objective_index(
+                        activation_result["F"],
+                        utility_tol=max(float(cfg.GA_CONV_EPS), 1e-6),
+                    )
+                    scale_best_gene = activation_result["X"][best_i].astype(bool)
+                    scale_nsga_runtime = float(activation_result.get("runtime_s", 0.0))
+                    activation_cache[cache_key] = (scale_best_gene, scale_nsga_runtime)
 
-            engine = SimulationEngine(cfg, sub_dl)
-            for item in build_method_configs(sub_dl, scale_best_gene):
-                if item["method_id"] not in series:
-                    series[item["method_id"]] = {
+                engine = SimulationEngine(load_cfg, sub_dl)
+                task_arrival_offered_mb = float(engine.task_arrival_by_region.sum())
+                offered_load_mb = float(min(float(load_cfg.TASK_DATA_MB), max(task_arrival_offered_mb, 0.0)))
+                if offered_load_mb <= 1e-9:
+                    offered_load_mb = float(load_cfg.TASK_DATA_MB)
+                for item in build_method_configs(sub_dl, scale_best_gene):
+                    if item["method_id"] not in SCALE_HUNGARIAN_METHOD_IDS:
+                        continue
+                    series_key = (float(load_factor), str(item["method_id"]))
+                    if series_key not in series:
+                        series[series_key] = {
+                            "load_factor": float(load_factor),
+                            "task_data_mb": float(load_cfg.TASK_DATA_MB),
+                            "task_gen_rate": float(load_cfg.TASK_GEN_RATE),
+                            "task_arrival_offered_mb": float(task_arrival_offered_mb),
+                            "offered_load_mb": float(offered_load_mb),
+                            "method_id": item["method_id"],
+                            "label": item["label"],
+                            "activation": item["activation"],
+                            "candidate_graph": item["candidate_graph"],
+                            "matcher": item["matcher"],
+                            "color": _method_color(item["method_id"]),
+                            "raw": [],
+                        }
+                    eval_summaries = []
+                    counts = (0, 0)
+                    for _eval_rep in range(eval_repeats):
+                        _, counts, hist = engine.evaluate(
+                            item["gene"],
+                            track_history=False,
+                            return_summary=True,
+                            matcher_mode=item["matcher_mode"],
+                            use_topk=item["use_topk"],
+                            use_window_urgency=True,
+                            use_energy_score=True,
+                        )
+                        eval_summaries.append(dict(hist.get("summary", {})) if hist else {})
+                    summary = mean_summary(eval_summaries)
+                    activation_runtime_s = scale_nsga_runtime if item["activation"] == "NSGA-III" else 0.0
+                    total_runtime_s = activation_runtime_s + float(summary.get("simulation_runtime_s", 0.0))
+                    delivered_mb = float(summary.get("delivered_mb", 0.0))
+                    delivery_ratio_offered = float(min(delivered_mb / max(offered_load_mb, 1e-9), 1.0))
+                    raw_record = {
+                        "load_factor": float(load_factor),
+                        "task_data_mb": float(load_cfg.TASK_DATA_MB),
+                        "task_gen_rate": float(load_cfg.TASK_GEN_RATE),
+                        "task_arrival_offered_mb": float(task_arrival_offered_mb),
+                        "offered_load_mb": float(offered_load_mb),
+                        "satellite_count": int(sub_dl.N),
+                        "repeat": int(rep + 1),
+                        "eval_repeats": int(eval_repeats),
                         "method_id": item["method_id"],
                         "label": item["label"],
                         "activation": item["activation"],
                         "candidate_graph": item["candidate_graph"],
                         "matcher": item["matcher"],
-                        "color": _method_color(item["method_id"]),
-                        "raw": [],
+                        "online_scheduling_time_s": float(summary.get("online_scheduling_time_s", 0.0)),
+                        "total_runtime_s": float(total_runtime_s),
+                        "activation_ratio": float(counts[1] / max(sub_dl.N, 1)),
+                        "candidate_comm_relay_ratio": float(summary.get("candidate_comm_relay_ratio", counts[1] / max(sub_dl.N, 1))),
+                        "actual_forward_participation_ratio": float(summary.get("actual_forward_participation_ratio", 0.0)),
+                        "actual_forward_unique_satellite_count": float(summary.get("actual_forward_unique_satellite_count", 0.0)),
+                        "actual_downlink_unique_satellite_count": float(summary.get("actual_downlink_unique_satellite_count", 0.0)),
+                        "avg_actual_isl_send_count": float(summary.get("avg_actual_isl_send_count", 0.0)),
+                        "max_actual_isl_send_count": float(summary.get("max_actual_isl_send_count", 0.0)),
+                        "avg_actual_isl_receive_count": float(summary.get("avg_actual_isl_receive_count", 0.0)),
+                        "max_actual_isl_receive_count": float(summary.get("max_actual_isl_receive_count", 0.0)),
+                        "avg_actual_downlink_count": float(summary.get("avg_actual_downlink_count", 0.0)),
+                        "max_actual_downlink_count": float(summary.get("max_actual_downlink_count", 0.0)),
+                        "avg_delivered_relay_hops": float(summary.get("avg_delivered_relay_hops", 0.0)),
+                        "avg_delivery_latency_s": float(summary.get("avg_delivery_latency_s", 0.0)),
+                        "max_observed_relay_hops": float(summary.get("max_observed_relay_hops", 0.0)),
+                        "dropped_ttl_mb": float(summary.get("dropped_ttl_mb", 0.0)),
+                        "dropped_melt_mb": float(summary.get("dropped_melt_mb", 0.0)),
+                        "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
+                        "delivery_ratio_offered": float(delivery_ratio_offered),
+                        "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
+                        "utility": float(summary.get("utility", 0.0)),
                     }
-                eval_summaries = []
-                counts = (0, 0)
-                for _eval_rep in range(eval_repeats):
-                    _, counts, hist = engine.evaluate(
-                        item["gene"],
-                        track_history=False,
-                        return_summary=True,
-                        matcher_mode=item["matcher_mode"],
-                        use_topk=item["use_topk"],
-                        use_window_urgency=True,
-                        use_energy_score=True,
-                    )
-                    eval_summaries.append(dict(hist.get("summary", {})) if hist else {})
-                summary = mean_summary(eval_summaries)
-                activation_runtime_s = scale_nsga_runtime if item["activation"] == "NSGA-III" else 0.0
-                total_runtime_s = activation_runtime_s + float(summary.get("simulation_runtime_s", 0.0))
-                raw_record = {
-                    "satellite_count": int(sub_dl.N),
-                    "repeat": int(rep + 1),
-                    "eval_repeats": int(eval_repeats),
-                    "method_id": item["method_id"],
-                    "label": item["label"],
-                    "activation": item["activation"],
-                    "candidate_graph": item["candidate_graph"],
-                    "matcher": item["matcher"],
-                    "online_scheduling_time_s": float(summary.get("online_scheduling_time_s", 0.0)),
-                    "total_runtime_s": float(total_runtime_s),
-                    "activation_ratio": float(counts[1] / max(sub_dl.N, 1)),
-                    "candidate_comm_relay_ratio": float(summary.get("candidate_comm_relay_ratio", counts[1] / max(sub_dl.N, 1))),
-                    "actual_forward_participation_ratio": float(summary.get("actual_forward_participation_ratio", 0.0)),
-                    "actual_forward_unique_satellite_count": float(summary.get("actual_forward_unique_satellite_count", 0.0)),
-                    "actual_downlink_unique_satellite_count": float(summary.get("actual_downlink_unique_satellite_count", 0.0)),
-                    "avg_actual_isl_send_count": float(summary.get("avg_actual_isl_send_count", 0.0)),
-                    "max_actual_isl_send_count": float(summary.get("max_actual_isl_send_count", 0.0)),
-                    "avg_actual_isl_receive_count": float(summary.get("avg_actual_isl_receive_count", 0.0)),
-                    "max_actual_isl_receive_count": float(summary.get("max_actual_isl_receive_count", 0.0)),
-                    "avg_actual_downlink_count": float(summary.get("avg_actual_downlink_count", 0.0)),
-                    "max_actual_downlink_count": float(summary.get("max_actual_downlink_count", 0.0)),
-                    "avg_delivered_relay_hops": float(summary.get("avg_delivered_relay_hops", 0.0)),
-                    "avg_delivery_latency_s": float(summary.get("avg_delivery_latency_s", 0.0)),
-                    "max_observed_relay_hops": float(summary.get("max_observed_relay_hops", 0.0)),
-                    "dropped_ttl_mb": float(summary.get("dropped_ttl_mb", 0.0)),
-                    "dropped_melt_mb": float(summary.get("dropped_melt_mb", 0.0)),
-                    "delivery_ratio": float(summary.get("delivery_ratio", 0.0)),
-                    "packet_loss_rate": float(summary.get("packet_loss_rate", 0.0)),
-                    "utility": float(summary.get("utility", 0.0)),
-                }
-                series[item["method_id"]]["raw"].append(raw_record)
-                raw_rows.append(raw_record)
-            print(f"  scale point nodes={sub_dl.N} repeat {rep + 1}/{repeat_count} completed")
+                    series[series_key]["raw"].append(raw_record)
+                    raw_rows.append(raw_record)
+                print(
+                    f"  scale point load={load_factor:.1f}x nodes={sub_dl.N} "
+                    f"repeat {rep + 1}/{repeat_count} completed"
+                )
 
     for method in series.values():
         records = list(method.pop("raw", []))
@@ -2772,8 +2814,13 @@ def run_scalability_experiment(
         "repeat_count": int(repeat_count),
         "eval_repeats": int(eval_repeats),
         "task_packet_mb": float(cfg.TASK_PACKET_MB),
+        "load_factors": [float(x) for x in SCALE_LOAD_FACTORS],
+        "base_task_data_mb": float(cfg.TASK_DATA_MB),
+        "base_task_gen_rate": float(cfg.TASK_GEN_RATE),
         "definitions": {
             "delivery_ratio": "delivered_mb/TASK_DATA_MB",
+            "delivery_ratio_offered": "delivered_mb/offered_load_mb",
+            "offered_load_mb": "min(TASK_DATA_MB, task_arrival_offered_mb)",
             "packet_loss_rate": "dropped_mb/generated_mb",
             "online_time": "online ISL matching plus Beijing ground-station downlink selection time",
             "avg_delivery_latency_s": "MB-weighted average end-to-end delay from sensing-batch generation to Beijing ground-station downlink",
@@ -2806,6 +2853,7 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
         "dropped_ttl_mb",
         "dropped_melt_mb",
         "delivery_ratio",
+        "delivery_ratio_offered",
         "packet_loss_rate",
         "utility",
     ]
@@ -2824,6 +2872,11 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
             "repeat_count": repeat_count,
             "eval_repeats": int(raw.get("eval_repeats", eval_repeats)),
             "task_packet_mb": task_packet_mb,
+            "load_factor": float(raw.get("load_factor", 1.0)),
+            "task_data_mb": float(raw.get("task_data_mb", scale.get("base_task_data_mb", 0.0) if scale else 0.0)),
+            "task_gen_rate": float(raw.get("task_gen_rate", scale.get("base_task_gen_rate", 0.0) if scale else 0.0)),
+            "task_arrival_offered_mb": float(raw.get("task_arrival_offered_mb", 0.0)),
+            "offered_load_mb": float(raw.get("offered_load_mb", 0.0)),
             "method_id": raw.get("method_id", ""),
             "method": raw.get("label", ""),
             "activation": raw.get("activation", ""),
@@ -2844,6 +2897,11 @@ def save_scalability_outputs(out_dir: Path, scale: Dict) -> None:
                 "repeat_count": repeat_count,
                 "eval_repeats": eval_repeats,
                 "task_packet_mb": task_packet_mb,
+                "load_factor": float(method.get("load_factor", 1.0)),
+                "task_data_mb": float(method.get("task_data_mb", scale.get("base_task_data_mb", 0.0) if scale else 0.0)),
+                "task_gen_rate": float(method.get("task_gen_rate", scale.get("base_task_gen_rate", 0.0) if scale else 0.0)),
+                "task_arrival_offered_mb": float(method.get("task_arrival_offered_mb", 0.0)),
+                "offered_load_mb": float(method.get("offered_load_mb", 0.0)),
                 "method_id": method.get("method_id", ""),
                 "method": method.get("label", ""),
                 "activation": method.get("activation", ""),
@@ -3966,6 +4024,18 @@ class Visualizer:
         filtered["methods"] = [method for method in filtered.get("methods", []) if str(method.get("method_id", "")) in wanted]
         return filtered
 
+    @staticmethod
+    def _filter_scale_load(scale: Dict, load_factor: float = 1.0) -> Dict:
+        filtered = dict(scale or {})
+        target = float(load_factor)
+        filtered["methods"] = [
+            method
+            for method in filtered.get("methods", [])
+            if abs(float(method.get("load_factor", 1.0)) - target) <= 1e-9
+        ]
+        filtered["load_factors"] = [target]
+        return filtered
+
     def _plot_scale_metric(
         self,
         scale: Dict,
@@ -4186,7 +4256,7 @@ class Visualizer:
 
     def fig1_scale_online_time(self, scale: Dict) -> None:
         self._plot_scale_metric(
-            self._filter_scale_methods(scale),
+            self._filter_scale_methods(self._filter_scale_load(scale, 1.0)),
             "online_scheduling_time_s",
             "在线调度时间(s)",
             "图1  卫星数量与在线调度时间",
@@ -4311,7 +4381,208 @@ class Visualizer:
         fig.suptitle("图4  Top-K稀疏候选图的交付性能权衡", fontsize=13, fontweight="bold")
         self._save("Fig4_Scale_Delivery_Ratio.png")
 
+    def _fig4_scale_delivery_ratio_by_load(self, scale: Dict) -> None:
+        scale = self._filter_scale_methods(scale)
+        nodes = np.asarray(scale.get("nodes", []), dtype=float)
+        methods = scale.get("methods", []) if scale else []
+        if len(nodes) == 0 or not methods:
+            self._empty_figure("Fig4_Scale_Delivery_Ratio.png", "图4  卫星数量与不同任务负载下的交付率", "没有规模实验数据。")
+            return
+
+        metric_key = "delivery_ratio_offered"
+
+        def metric_values(method: Dict, key: str, fallback_key: Optional[str] = None) -> np.ndarray:
+            vals = np.asarray(method.get(key, []), dtype=float)
+            if len(vals) == len(nodes):
+                return vals
+            if fallback_key is not None:
+                vals = np.asarray(method.get(fallback_key, []), dtype=float)
+                if len(vals) == len(nodes):
+                    return vals
+            return np.asarray([], dtype=float)
+
+        delivery_values: List[float] = []
+        for method in methods:
+            for key, fallback in (
+                (metric_key, "delivery_ratio"),
+                (f"{metric_key}_q25", "delivery_ratio_q25"),
+                (f"{metric_key}_q75", "delivery_ratio_q75"),
+            ):
+                vals = metric_values(method, key, fallback)
+                delivery_values.extend(float(v) for v in vals if np.isfinite(float(v)))
+
+        ylim = None
+        if delivery_values:
+            lo = max(0.0, float(np.min(delivery_values)) - 0.03)
+            hi = min(1.02, float(np.max(delivery_values)) + 0.03)
+            if hi - lo < 0.10:
+                mid = 0.5 * (lo + hi)
+                lo = max(0.0, mid - 0.05)
+                hi = min(1.02, mid + 0.05)
+            ylim = (lo, hi)
+
+        from matplotlib.lines import Line2D
+
+        fig, ax = self.plt.subplots(figsize=(11.8, 6.7))
+        markers = ["o", "s", "D", "^"]
+        line_styles = ["-", (0, (5, 2)), (0, (1.4, 2.0)), (0, (3, 1, 1, 1))]
+        method_ids = [
+            method_id
+            for method_id in SCALE_HUNGARIAN_METHOD_IDS
+            if any(str(method.get("method_id", "")) == method_id for method in methods)
+        ]
+        load_factors = sorted({float(method.get("load_factor", 1.0)) for method in methods})
+        method_templates = {
+            method_id: next(method for method in methods if str(method.get("method_id", "")) == method_id)
+            for method_id in method_ids
+        }
+        method_style = {
+            method_id: {
+                "color": method_templates[method_id].get("color", _method_color(method_id)),
+                "marker": markers[i % len(markers)],
+                "label": self._zh_label(method_templates[method_id].get("label", method_id)),
+            }
+            for i, method_id in enumerate(method_ids)
+        }
+        load_style = {factor: line_styles[i % len(line_styles)] for i, factor in enumerate(load_factors)}
+
+        for load_factor in load_factors:
+            for method_id in method_ids:
+                method = next(
+                    (
+                        item
+                        for item in methods
+                        if str(item.get("method_id", "")) == method_id
+                        and abs(float(item.get("load_factor", 1.0)) - load_factor) <= 1e-9
+                    ),
+                    None,
+                )
+                if method is None:
+                    continue
+                vals = metric_values(method, metric_key, "delivery_ratio")
+                if len(vals) != len(nodes):
+                    continue
+                style = method_style[method_id]
+                ax.plot(
+                    nodes,
+                    vals,
+                    marker=style["marker"],
+                    linestyle=load_style[load_factor],
+                    lw=1.8,
+                    ms=5.7,
+                    color=style["color"],
+                    alpha=0.95,
+                )
+
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+        ax.set_xlabel("卫星数量", fontsize=11)
+        ax.set_ylabel("交付率(delivered/offered load)", fontsize=11)
+        ax.set_title("图4  卫星数量与不同任务负载下的交付率", fontsize=13, fontweight="bold")
+        ax.grid(True, which="major", ls="--", alpha=0.24)
+        ax.grid(True, which="minor", ls=":", alpha=0.12)
+
+        method_handles = [
+            Line2D(
+                [0],
+                [0],
+                color=style["color"],
+                marker=style["marker"],
+                linestyle="-",
+                lw=1.8,
+                ms=5.7,
+                label=style["label"],
+            )
+            for style in method_style.values()
+        ]
+        load_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="#333333",
+                linestyle=load_style[load_factor],
+                lw=1.8,
+                label=f"{load_factor:.1f}x任务量",
+            )
+            for load_factor in load_factors
+        ]
+        method_legend = ax.legend(
+            handles=method_handles,
+            title="方法",
+            ncol=4,
+            fontsize=8.0,
+            title_fontsize=8.2,
+            framealpha=0.96,
+            facecolor="white",
+            edgecolor="#BDBDBD",
+            loc="upper center",
+            bbox_to_anchor=(0.50, -0.13),
+        )
+        ax.add_artist(method_legend)
+        ax.legend(
+            handles=load_handles,
+            title="任务负载",
+            ncol=max(1, min(3, len(load_handles))),
+            fontsize=8.0,
+            title_fontsize=8.2,
+            framealpha=0.96,
+            facecolor="white",
+            edgecolor="#BDBDBD",
+            loc="upper right",
+        )
+
+        inset_mask = (nodes >= 1000.0) & (nodes <= 7500.0)
+        if np.any(inset_mask):
+            inset = ax.inset_axes([0.07, 0.12, 0.40, 0.34])
+            inset_values: List[float] = []
+            inset_nodes = nodes[inset_mask]
+            for load_factor in load_factors:
+                for method_id in method_ids:
+                    method = next(
+                        (
+                            item
+                            for item in methods
+                            if str(item.get("method_id", "")) == method_id
+                            and abs(float(item.get("load_factor", 1.0)) - load_factor) <= 1e-9
+                        ),
+                        None,
+                    )
+                    if method is None:
+                        continue
+                    vals = metric_values(method, metric_key, "delivery_ratio")
+                    if len(vals) != len(nodes):
+                        continue
+                    inset_vals = vals[inset_mask]
+                    inset_values.extend(float(v) for v in inset_vals if np.isfinite(float(v)))
+                    style = method_style[method_id]
+                    inset.plot(
+                        inset_nodes,
+                        inset_vals,
+                        marker=style["marker"],
+                        linestyle=load_style[load_factor],
+                        lw=1.05,
+                        ms=3.1,
+                        color=style["color"],
+                        alpha=0.95,
+                    )
+            inset.set_xlim(1000.0, 7500.0)
+            if inset_values:
+                in_lo = max(0.0, float(np.min(inset_values)) - 0.015)
+                in_hi = min(1.02, float(np.max(inset_values)) + 0.015)
+                if in_hi - in_lo < 0.05:
+                    mid = 0.5 * (in_lo + in_hi)
+                    in_lo = max(0.0, mid - 0.025)
+                    in_hi = min(1.02, mid + 0.025)
+                inset.set_ylim(in_lo, in_hi)
+            inset.set_title("1000-7500局部放大", fontsize=8.0)
+            inset.tick_params(axis="both", labelsize=7.0)
+            inset.grid(True, ls="--", alpha=0.22)
+
+        self._save("Fig4_Scale_Delivery_Ratio.png")
+
     def fig4_scale_delivery_ratio(self, scale: Dict) -> None:
+        self._fig4_scale_delivery_ratio_by_load(scale)
+        return
         scale = self._filter_scale_methods(scale)
         nodes = np.asarray(scale.get("nodes", []), dtype=float)
         methods = scale.get("methods", []) if scale else []
@@ -4399,7 +4670,7 @@ class Visualizer:
 
     def fig14_average_delivery_latency(self, scale: Dict) -> None:
         self._plot_scale_metric(
-            self._filter_scale_methods(scale),
+            self._filter_scale_methods(self._filter_scale_load(scale, 1.0)),
             "avg_delivery_latency_s",
             "平均端到端交付时延(s)",
             "图14  筛选后卫星星座的平均端到端交付时延",
