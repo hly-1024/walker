@@ -3410,15 +3410,17 @@ def build_ablation_state_metric_rows(ablation: Dict) -> List[Dict]:
 
 def save_academic_experiment_outputs(
     out_dir: Path,
-    topk: Dict,
-    sparse: Dict,
+    topk: Optional[Dict],
+    sparse: Optional[Dict],
     ablation: Dict,
     topk_prefilter_ablation: Optional[Dict] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(topk.get("rows", [])).to_csv(out_dir / "table3_topk_sensitivity.csv", index=False, encoding="utf-8-sig")
-    sparse_table_rows = list(sparse.get("raw_rows", [])) + list(sparse.get("rows", []))
-    pd.DataFrame(sparse_table_rows).to_csv(out_dir / "table4_sparse_activation_curve.csv", index=False, encoding="utf-8-sig")
+    if topk is not None:
+        pd.DataFrame(topk.get("rows", [])).to_csv(out_dir / "table3_topk_sensitivity.csv", index=False, encoding="utf-8-sig")
+    if sparse is not None:
+        sparse_table_rows = list(sparse.get("raw_rows", [])) + list(sparse.get("rows", []))
+        pd.DataFrame(sparse_table_rows).to_csv(out_dir / "table4_sparse_activation_curve.csv", index=False, encoding="utf-8-sig")
     ablation_rows = list(ablation.get("rows", []))
     pd.DataFrame(ablation_rows).to_csv(out_dir / "table5_ablation.csv", index=False, encoding="utf-8-sig")
     fig10_rows = [row for row in ablation_rows if str(row.get("method", "")) in set(FIG10_MAIN_METHODS)]
@@ -4432,22 +4434,10 @@ def main() -> None:
         vis.fig4_scale_delivery_ratio(scale)
         vis.fig4a_task_load_delivery_ratio(task_load)
         vis.fig14_average_delivery_latency(scale)
-        stress_cfg = make_stress_config(cfg)
-        print("=" * 72)
-        print(
-            "S6 Stress scenario for academic comparison figures: "
-            f"TASK_DATA_MB={stress_cfg.TASK_DATA_MB:.1f}, "
-            f"TX_ISL={stress_cfg.TX_RATE_ISL:.1f}, TX_SGL={stress_cfg.TX_RATE_SGL:.1f}, "
-            f"GS_ANTENNAS={stress_cfg.GS_ANTENNAS}, Q_MAX={stress_cfg.Q_MAX_COMM:.1f}"
-        )
-        print("=" * 72)
-        stress_problem = ConstellationProblem(stress_cfg, dl)
-        stress_result = NSGA3Solver(stress_cfg).optimize(stress_problem.evaluate, dl.N)
-        stress_best_i = select_best_objective_index(stress_result["F"], utility_tol=max(float(stress_cfg.GA_CONV_EPS), 1e-6))
-        stress_best_gene = stress_result["X"][stress_best_i].astype(bool)
-        topk_exp = run_topk_sensitivity_experiment(stress_cfg, dl, stress_best_gene)
-        topk_prefilter_ablation = run_topk_prefilter_ablation_experiment(stress_cfg, dl, stress_best_gene)
-        sparse_exp = run_sparse_activation_curve_experiment(stress_cfg, dl, stress_best_gene)
+        topk_exp = None
+        topk_prefilter_ablation = None
+        sparse_exp = None
+        print("  skipped Fig8/Fig9/Fig15 experiments and related tables")
         ablation_cfg = make_ablation_stress_config(cfg)
         ablation_dl = _with_task_region_weights(dl, ABLATION_TASK_REGION_WEIGHTS, ablation_cfg)
         print("=" * 72)
@@ -4475,11 +4465,8 @@ def main() -> None:
             ablation_exp,
             topk_prefilter_ablation=topk_prefilter_ablation,
         )
-        vis.fig8_topk_efficiency_performance(topk_exp)
-        vis.fig9_sparse_activation_utility_curve(sparse_exp)
         vis.fig10_cross_layer_ablation(ablation_exp)
         vis.fig10b_ablation_state_metrics_table(ablation_exp)
-        vis.fig15_topk_prefilter_ablation(topk_prefilter_ablation)
 
     print("=" * 72)
     print("Done")
