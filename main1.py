@@ -38,7 +38,7 @@ TASK_REGIONS = (
     {"name": "Urumqi", "lat": 43.82, "lon": 87.62, "weight": 0.20},
 )
 
-SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 1000)))
+SCALE_NODE_TARGETS = tuple([100, 500] + list(range(1000, 20001, 2000)))
 SCALE_HUNGARIAN_METHOD_IDS = ("M3", "M4", "M7", "M8")
 SCALE_LOAD_FACTORS = (1.0, 1.5, 2.0)
 TOPK_SENSITIVITY_VALUES = (1, 2, 3, 4, 6, 8, 10, 12)
@@ -208,7 +208,7 @@ class Config:
     ISL_MAX_DIST: float = 4000.0
     ISL_NEIGHBOR_K: int = 12
     TOPK_CANDIDATES: int = 12
-    TOPK_PREFILTER_POOL: int = 48
+    TOPK_PREFILTER_POOL: int = 12
     TOPK_PREFILTER_MODE: str = "cross_layer"
     TOPK_W_DISTANCE: float = 0.20
     TOPK_W_FUTURE_GS: float = 0.25
@@ -216,12 +216,12 @@ class Config:
     TOPK_W_BUFFER: float = 0.15
     TOPK_W_ENERGY: float = 0.10
     TOPK_W_TASK: float = 0.05
-    ADAPTIVE_K_BASE: int = 8
-    ADAPTIVE_K_MIN: int = 4
-    ADAPTIVE_K_MAX: int = 12
-    ADAPTIVE_K_ALPHA: float = 8.0
-    ADAPTIVE_K_BETA: float = 6.0
-    ADAPTIVE_K_GAMMA: float = 6.0
+    ADAPTIVE_K_BASE: int = 2
+    ADAPTIVE_K_MIN: int = 1
+    ADAPTIVE_K_MAX: int = 4
+    ADAPTIVE_K_ALPHA: float = 4.0
+    ADAPTIVE_K_BETA: float = 2.0
+    ADAPTIVE_K_GAMMA: float = 2.0
     HUNGARIAN_MAX_CELLS: int = 250_000
 
     R_SENSOR: float = 100.0
@@ -1959,21 +1959,49 @@ class ConstellationProblem:
     inside SimulationEngine.evaluate() over the selected cross-layer topology.
     """
 
-    def __init__(self, cfg: Config, dl: DataLoader):
+    def __init__(
+        self,
+        cfg: Config,
+        dl: DataLoader,
+        matcher_mode: str = "hungarian",
+        use_topk: bool = True,
+        use_window_urgency: bool = True,
+        use_energy_score: bool = True,
+    ):
         self.cfg = cfg
         self.dl = dl
+        self.matcher_mode = matcher_mode
+        self.use_topk = bool(use_topk)
+        self.use_window_urgency = bool(use_window_urgency)
+        self.use_energy_score = bool(use_energy_score)
         self.engine = SimulationEngine(cfg, dl)
 
     def evaluate(self, genes: np.ndarray) -> List[float]:
-        _, counts, hist = self.engine.evaluate(genes, return_summary=True)
+        _, counts, hist = self.engine.evaluate(
+            genes,
+            return_summary=True,
+            matcher_mode=self.matcher_mode,
+            use_topk=self.use_topk,
+            use_window_urgency=self.use_window_urgency,
+            use_energy_score=self.use_energy_score,
+        )
         n_sense, n_comm = counts
         summary = dict(hist.get("summary", {})) if hist else {}
         return [-float(summary.get("utility", 0.0)), float(n_sense), float(n_comm)]
 
 
-def build_method_configs(dl: DataLoader, best_gene: np.ndarray) -> List[Dict]:
+def build_method_configs(
+    dl: DataLoader,
+    best_gene: np.ndarray,
+    nsga_genes: Optional[Dict[str, np.ndarray]] = None,
+    nsga_runtimes: Optional[Dict[str, float]] = None,
+) -> List[Dict]:
     full_gene = np.ones(2 * dl.N, dtype=bool)
     nsga_gene = np.asarray(best_gene, dtype=bool).copy()
+    nsga_genes = nsga_genes or {}
+    nsga_runtimes = nsga_runtimes or {}
+    m7_gene = np.asarray(nsga_genes.get("M7", nsga_gene), dtype=bool).copy()
+    m8_gene = np.asarray(nsga_genes.get("M8", nsga_gene), dtype=bool).copy()
     return [
         {
             "method_id": "M1",
@@ -2048,9 +2076,10 @@ def build_method_configs(dl: DataLoader, best_gene: np.ndarray) -> List[Dict]:
             "activation": "NSGA-III",
             "candidate_graph": "Full Graph",
             "matcher": "Hungarian",
-            "gene": nsga_gene,
+            "gene": m7_gene,
             "matcher_mode": "hungarian",
             "use_topk": False,
+            "activation_runtime_s": float(nsga_runtimes.get("M7", 0.0)),
         },
         {
             "method_id": "M8",
@@ -2059,9 +2088,10 @@ def build_method_configs(dl: DataLoader, best_gene: np.ndarray) -> List[Dict]:
             "activation": "NSGA-III",
             "candidate_graph": "Top-K Graph",
             "matcher": "Hungarian",
-            "gene": nsga_gene,
+            "gene": m8_gene,
             "matcher_mode": "hungarian",
             "use_topk": True,
+            "activation_runtime_s": float(nsga_runtimes.get("M8", 0.0)),
         },
     ]
 
@@ -2085,12 +2115,14 @@ def run_method_comparison_experiment(
     dl: DataLoader,
     best_gene: np.ndarray,
     nsga_runtime_s: float = 0.0,
+    nsga_genes: Optional[Dict[str, np.ndarray]] = None,
+    nsga_runtimes: Optional[Dict[str, float]] = None,
 ) -> Dict:
     print("=" * 72)
     print("S3 M1-M8 comparison experiment")
     print("=" * 72)
     engine = SimulationEngine(cfg, dl)
-    methods = build_method_configs(dl, best_gene)
+    methods = build_method_configs(dl, best_gene, nsga_genes=nsga_genes, nsga_runtimes=nsga_runtimes)
     repeats = max(1, int(cfg.BASELINE_REPEATS))
     rows: List[Dict] = []
 
@@ -2121,7 +2153,13 @@ def run_method_comparison_experiment(
             sim_samples.append(float(sample_summary.get("simulation_runtime_s", 0.0)))
             online_samples.append(float(sample_summary.get("online_scheduling_time_s", 0.0)))
 
-        activation_runtime_s = float(nsga_runtime_s) if item["activation"] == "NSGA-III" else 0.0
+        activation_runtime_s = (
+            float(item.get("activation_runtime_s", nsga_runtime_s))
+            if item["activation"] == "NSGA-III"
+            else 0.0
+        )
+        if item["activation"] == "NSGA-III" and activation_runtime_s <= 0.0:
+            activation_runtime_s = float(nsga_runtime_s)
         summary["method_id"] = item["method_id"]
         summary["method_name"] = item["method_name"]
         summary["label"] = item["label"]
@@ -2263,7 +2301,7 @@ def run_scalability_experiment(
         np.random.default_rng(int(cfg.RNG_SEED) + 20260519 + 7919 * rep).permutation(n_total).astype(np.int32)
         for rep in range(repeat_count)
     ]
-    activation_cache: Dict[Tuple[int, int], Tuple[np.ndarray, float]] = {}
+    activation_cache: Dict[Tuple[int, int], Tuple[Dict[str, np.ndarray], Dict[str, float]]] = {}
     series: Dict[str, Dict] = {}
     raw_rows: List[Dict] = []
     metric_keys = [
@@ -2304,6 +2342,28 @@ def run_scalability_experiment(
                 merged[key] = float(np.mean(np.asarray(vals, dtype=np.float64)))
         return merged
 
+    def optimize_scale_gene(
+        activation_dl: DataLoader,
+        method_id: str,
+        use_topk: bool,
+        seed: int,
+    ) -> Tuple[np.ndarray, float]:
+        graph_label = "Top-K Graph" if use_topk else "Full Graph"
+        print(f"    optimizing {method_id} activation under {graph_label} + Hungarian")
+        np.random.seed(int(seed))
+        activation_problem = ConstellationProblem(
+            cfg,
+            activation_dl,
+            matcher_mode="hungarian",
+            use_topk=use_topk,
+        )
+        activation_result = NSGA3Solver(cfg).optimize(activation_problem.evaluate, activation_dl.N)
+        best_i = select_best_objective_index(
+            activation_result["F"],
+            utility_tol=max(float(cfg.GA_CONV_EPS), 1e-6),
+        )
+        return activation_result["X"][best_i].astype(bool), float(activation_result.get("runtime_s", 0.0))
+
     for load_i, load_factor in enumerate(SCALE_LOAD_FACTORS):
         load_cfg = replace(cfg)
         load_cfg.TASK_DATA_MB = float(cfg.TASK_DATA_MB) * float(load_factor)
@@ -2317,34 +2377,45 @@ def run_scalability_experiment(
                 sub_dl = _subset_dataloader(dl, load_cfg, sat_idx)
                 cache_key = (int(n), int(rep))
                 if cache_key in activation_cache:
-                    scale_best_gene, scale_nsga_runtime = activation_cache[cache_key]
+                    scale_nsga_genes, scale_nsga_runtimes = activation_cache[cache_key]
                     print(
                         f"  scale point load={load_factor:.1f}x nodes={sub_dl.N}: "
-                        f"repeat {rep + 1}/{repeat_count} reusing baseline NSGA-III activation"
+                        f"repeat {rep + 1}/{repeat_count} reusing M7/M8 NSGA-III activations"
                     )
                 else:
                     print(
                         f"  scale point load={load_factor:.1f}x nodes={sub_dl.N}: "
-                        f"repeat {rep + 1}/{repeat_count} running NSGA-III activation optimization"
+                        f"repeat {rep + 1}/{repeat_count} running M7/M8 NSGA-III activation optimization"
                     )
-                    np.random.seed(int(cfg.RNG_SEED) + 20260519 + 100003 * rep + int(n))
-                    activation_problem = ConstellationProblem(cfg, _subset_dataloader(dl, cfg, sat_idx))
-                    activation_solver = NSGA3Solver(cfg)
-                    activation_result = activation_solver.optimize(activation_problem.evaluate, sub_dl.N)
-                    best_i = select_best_objective_index(
-                        activation_result["F"],
-                        utility_tol=max(float(cfg.GA_CONV_EPS), 1e-6),
+                    activation_dl = _subset_dataloader(dl, cfg, sat_idx)
+                    base_seed = int(cfg.RNG_SEED) + 20260519 + 100003 * rep + int(n)
+                    m7_gene, m7_runtime = optimize_scale_gene(
+                        activation_dl,
+                        "M7",
+                        use_topk=False,
+                        seed=base_seed + 7007,
                     )
-                    scale_best_gene = activation_result["X"][best_i].astype(bool)
-                    scale_nsga_runtime = float(activation_result.get("runtime_s", 0.0))
-                    activation_cache[cache_key] = (scale_best_gene, scale_nsga_runtime)
+                    m8_gene, m8_runtime = optimize_scale_gene(
+                        activation_dl,
+                        "M8",
+                        use_topk=True,
+                        seed=base_seed,
+                    )
+                    scale_nsga_genes = {"M7": m7_gene, "M8": m8_gene}
+                    scale_nsga_runtimes = {"M7": m7_runtime, "M8": m8_runtime}
+                    activation_cache[cache_key] = (scale_nsga_genes, scale_nsga_runtimes)
 
                 engine = SimulationEngine(load_cfg, sub_dl)
                 task_arrival_offered_mb = float(engine.task_arrival_by_region.sum())
                 offered_load_mb = float(min(float(load_cfg.TASK_DATA_MB), max(task_arrival_offered_mb, 0.0)))
                 if offered_load_mb <= 1e-9:
                     offered_load_mb = float(load_cfg.TASK_DATA_MB)
-                for item in build_method_configs(sub_dl, scale_best_gene):
+                for item in build_method_configs(
+                    sub_dl,
+                    scale_nsga_genes["M8"],
+                    nsga_genes=scale_nsga_genes,
+                    nsga_runtimes=scale_nsga_runtimes,
+                ):
                     if item["method_id"] not in SCALE_HUNGARIAN_METHOD_IDS:
                         continue
                     series_key = (float(load_factor), str(item["method_id"]))
@@ -2377,7 +2448,11 @@ def run_scalability_experiment(
                         )
                         eval_summaries.append(dict(hist.get("summary", {})) if hist else {})
                     summary = mean_summary(eval_summaries)
-                    activation_runtime_s = scale_nsga_runtime if item["activation"] == "NSGA-III" else 0.0
+                    activation_runtime_s = (
+                        float(item.get("activation_runtime_s", 0.0))
+                        if item["activation"] == "NSGA-III"
+                        else 0.0
+                    )
                     total_runtime_s = activation_runtime_s + float(summary.get("simulation_runtime_s", 0.0))
                     delivered_mb = float(summary.get("delivered_mb", 0.0))
                     delivery_ratio_offered = float(min(delivered_mb / max(offered_load_mb, 1e-9), 1.0))
@@ -3974,12 +4049,25 @@ def main() -> None:
     print(f"constraint valid     : {summary['constraint_valid']}")
     print(f"total runtime        : {summary['runtime_total_s']:.1f}s")
 
+    print("=" * 72)
+    print("S2b M7 Full Graph + Hungarian sparse activation optimization")
+    print("=" * 72)
+    np.random.seed(int(cfg.RNG_SEED) + 7007)
+    m7_problem = ConstellationProblem(cfg, dl, matcher_mode="hungarian", use_topk=False)
+    m7_result = NSGA3Solver(cfg).optimize(m7_problem.evaluate, dl.N)
+    m7_best_i = select_best_objective_index(m7_result["F"], utility_tol=max(float(cfg.GA_CONV_EPS), 1e-6))
+    m7_best_gene = m7_result["X"][m7_best_i].astype(bool)
+    nsga_genes = {"M7": m7_best_gene, "M8": best_gene}
+    nsga_runtimes = {"M7": float(m7_result.get("runtime_s", 0.0)), "M8": float(result.get("runtime_s", 0.0))}
+
     save_outputs(out_dir, cfg, dl, sense_on, comm_on, summary, result)
     comparison = run_method_comparison_experiment(
         cfg,
         dl,
         best_gene,
         nsga_runtime_s=float(result.get("runtime_s", 0.0)),
+        nsga_genes=nsga_genes,
+        nsga_runtimes=nsga_runtimes,
     )
     save_method_comparison_outputs(out_dir, comparison)
 
