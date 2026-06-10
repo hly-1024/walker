@@ -257,12 +257,15 @@ class Config:
     SPARSE_REPEATS: int = 1
     SCALABILITY_REPEATS: int = 1
     SCALABILITY_EVAL_REPEATS: int = 3
+    TASK_LOAD_REPEATS: int = 10
+    TASK_LOAD_EVAL_REPEATS: int = 1
 
     T0_DOY: float = 76.0
     T0_GMST: float = 0.5
 
     PLOT: bool = True
     USE_ISL_CACHE: bool = True
+    EXPERIMENT_SCOPE: str = "full"
 
 
 def apply_profile(cfg: Config, profile: str) -> Config:
@@ -273,6 +276,8 @@ def apply_profile(cfg: Config, profile: str) -> Config:
         cfg.GA_GEN = 2
         cfg.SCALABILITY_REPEATS = 1
         cfg.SCALABILITY_EVAL_REPEATS = 1
+        cfg.TASK_LOAD_REPEATS = 1
+        cfg.TASK_LOAD_EVAL_REPEATS = 1
     elif profile == "fast":
         cfg.MAX_STEPS = 240
         cfg.SAT_LIMIT = 400
@@ -280,6 +285,8 @@ def apply_profile(cfg: Config, profile: str) -> Config:
         cfg.GA_GEN = 12
         cfg.SCALABILITY_REPEATS = 1
         cfg.SCALABILITY_EVAL_REPEATS = 1
+        cfg.TASK_LOAD_REPEATS = 1
+        cfg.TASK_LOAD_EVAL_REPEATS = 1
     elif profile != "full":
         raise ValueError(f"unknown profile: {profile}")
     cfg.ISL_NEIGHBOR_K = int(max(cfg.ADAPTIVE_K_MAX, cfg.TOPK_PREFILTER_POOL))
@@ -2568,8 +2575,8 @@ def run_task_load_experiment(cfg: Config, dl: DataLoader) -> Dict:
 
     satellite_counts = task_load_node_targets(n_total)
     task_values = [float(x) for x in TASK_LOAD_VALUES_MB]
-    repeat_count = 1
-    eval_repeats = 1
+    repeat_count = int(max(1, getattr(cfg, "TASK_LOAD_REPEATS", 10)))
+    eval_repeats = int(max(1, getattr(cfg, "TASK_LOAD_EVAL_REPEATS", 1)))
     repeat_orders = [
         np.random.default_rng(int(cfg.RNG_SEED) + 20260609 + 7919 * rep).permutation(n_total).astype(np.int32)
         for rep in range(repeat_count)
@@ -4260,9 +4267,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--arrival", choices=["fixed", "poisson"], default=None)
     parser.add_argument("--task-packet-mb", type=float, default=None)
+    parser.add_argument("--experiment-scope", choices=["full", "fig4a"], default="full")
     parser.add_argument("--experiment-repeat-mode", choices=["single", "mean"], default=None)
     parser.add_argument("--scale-repeats", type=int, default=None)
     parser.add_argument("--scale-eval-repeats", type=int, default=None)
+    parser.add_argument("--task-load-repeats", type=int, default=None)
+    parser.add_argument("--task-load-eval-repeats", type=int, default=None)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-cache", action="store_true")
     return parser.parse_args()
@@ -4289,6 +4299,7 @@ def main() -> None:
         cfg.TASK_ARRIVAL_MODE = str(args.arrival)
     if args.task_packet_mb is not None:
         cfg.TASK_PACKET_MB = float(args.task_packet_mb)
+    cfg.EXPERIMENT_SCOPE = str(args.experiment_scope).strip().lower()
     if args.experiment_repeat_mode is not None:
         cfg.EXPERIMENT_REPEAT_MODE = str(args.experiment_repeat_mode)
     cfg.EXPERIMENT_REPEAT_MODE = str(cfg.EXPERIMENT_REPEAT_MODE).strip().lower()
@@ -4306,6 +4317,10 @@ def main() -> None:
         cfg.SCALABILITY_REPEATS = int(max(1, args.scale_repeats))
     if args.scale_eval_repeats is not None:
         cfg.SCALABILITY_EVAL_REPEATS = int(max(1, args.scale_eval_repeats))
+    if args.task_load_repeats is not None:
+        cfg.TASK_LOAD_REPEATS = int(max(1, args.task_load_repeats))
+    if args.task_load_eval_repeats is not None:
+        cfg.TASK_LOAD_EVAL_REPEATS = int(max(1, args.task_load_eval_repeats))
     if args.no_plots:
         cfg.PLOT = False
     if args.no_cache:
@@ -4330,11 +4345,26 @@ def main() -> None:
     print(
         "experiment repeat mode: "
         f"{cfg.EXPERIMENT_REPEAT_MODE}, scale_repeats={cfg.SCALABILITY_REPEATS}, "
-        f"scale_eval_repeats={cfg.SCALABILITY_EVAL_REPEATS}, sparse_repeats={cfg.SPARSE_REPEATS}"
+        f"scale_eval_repeats={cfg.SCALABILITY_EVAL_REPEATS}, sparse_repeats={cfg.SPARSE_REPEATS}, "
+        f"task_load_repeats={cfg.TASK_LOAD_REPEATS}, task_load_eval_repeats={cfg.TASK_LOAD_EVAL_REPEATS}"
     )
+    print(f"experiment scope: {cfg.EXPERIMENT_SCOPE}")
 
     t0 = time.perf_counter()
     dl = DataLoader(cfg)
+    if cfg.EXPERIMENT_SCOPE == "fig4a":
+        task_load = run_task_load_experiment(cfg, dl)
+        save_task_load_outputs(out_dir, task_load)
+        if cfg.PLOT:
+            vis = Visualizer(out_dir)
+            vis.fig4a_task_load_delivery_ratio(task_load)
+        print("=" * 72)
+        print("Fig4a task-load experiment completed")
+        print("=" * 72)
+        return
+    if cfg.EXPERIMENT_SCOPE != "full":
+        raise ValueError(f"unknown EXPERIMENT_SCOPE={cfg.EXPERIMENT_SCOPE!r}; use full or fig4a")
+
     problem = ConstellationProblem(cfg, dl)
     solver = NSGA3Solver(cfg)
     result = solver.optimize(problem.evaluate, dl.N)
